@@ -1,0 +1,70 @@
+name: Native CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Select an installed stable Xcode
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import plistlib
+          import re
+          from pathlib import Path
+
+          candidates = []
+          for app in Path('/Applications').glob('Xcode*.app'):
+              if any(word in app.name.lower() for word in ('beta', 'preview', '_rc')):
+                  continue
+              developer = app / 'Contents' / 'Developer'
+              if not (developer / 'usr/bin/xcodebuild').is_file():
+                  continue
+              with (app / 'Contents/Info.plist').open('rb') as stream:
+                  info = plistlib.load(stream)
+              text = info.get('CFBundleShortVersionString', '')
+              if not re.fullmatch(r'\d+(?:\.\d+)*', text):
+                  continue
+              version = tuple(int(part) for part in text.split('.'))
+              if version >= (16, 0):
+                  candidates.append((version, str(developer.resolve())))
+          if not candidates:
+              raise SystemExit('No supported stable Xcode is installed on this runner.')
+          version, developer = max(candidates)
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write(f'DEVELOPER_DIR={developer}\n')
+          print('Selected Xcode', '.'.join(map(str, version)), developer)
+          PY
+
+      - name: Test storage and build iPhone and Watch apps
+        shell: bash
+        run: bash Scripts/ci_build.sh
+
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0

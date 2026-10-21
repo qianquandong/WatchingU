@@ -1,0 +1,21 @@
+# Build and editor output
+.build/
+artifacts/
+DerivedData/
+*.xcarchive
+*.ipa
+*.dSYM/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+__pycache__/
+
+# Signing and local credentials
+*.p8
+*.p12
+*.mobileprovision
+*.provisionprofile
+.env
+.env.*
+Secrets.xcconfig
+Local.private.xcconfig
