@@ -288,9 +288,15 @@ PY
 authentication=(-authenticationKeyPath "$TF_PRIVATE_DIR/AuthKey.p8"
   -authenticationKeyID "$APP_STORE_CONNECT_API_KEY_ID"
   -authenticationKeyIssuerID "$APP_STORE_CONNECT_API_ISSUER_ID")
-archive_auth=()
+archive_options=()
+export_options=()
 if [[ "$APPLE_SIGNING_STYLE" == automatic ]]; then
-  archive_auth=(-allowProvisioningUpdates "${authentication[@]}")
+  # A fresh distribution-only team may have no registered development devices.
+  # Build the archive without signing or provisioning; App Store export below
+  # obtains distribution profiles and cloud signing using the API key.
+  archive_options=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=)
+  export_options=(-allowProvisioningUpdates "${authentication[@]}")
+  printf '%s\n' 'Archiving without signing. App Store distribution signing will occur during export.'
 fi
 run_private archive xcodebuild \
   -project DayTape.xcodeproj -scheme DayTape -configuration Release \
@@ -298,19 +304,21 @@ run_private archive xcodebuild \
   -derivedDataPath "$TF_PRIVATE_DIR/DerivedData" \
   -clonedSourcePackagesDirPath .build/SourcePackages \
   -xcconfig "$TF_PRIVATE_DIR/Signing.xcconfig" \
-  ${archive_auth[@]+"${archive_auth[@]}"} CURRENT_PROJECT_VERSION="$TF_BUILD_NUMBER" \
+  ${archive_options[@]+"${archive_options[@]}"} CURRENT_PROJECT_VERSION="$TF_BUILD_NUMBER" \
   CODE_SIGN_STYLE="$(python3 -c 'import os; print(os.environ["APPLE_SIGNING_STYLE"].capitalize())')" \
   archive
 
 run_private export xcodebuild -exportArchive \
   -archivePath "$TF_PRIVATE_DIR/DayTape.xcarchive" \
   -exportPath "$TF_PRIVATE_DIR/export" -exportOptionsPlist "$TF_PRIVATE_DIR/export.plist" \
-  ${archive_auth[@]+"${archive_auth[@]}"}
+  ${export_options[@]+"${export_options[@]}"}
 
-# Verify the exported package contains the paired Watch app and real OAuth ID.
+# Verify package metadata, then the actual distribution signatures/profiles.
 python3 - <<'PY'
+import datetime
 import os
 import plistlib
+import subprocess
 import zipfile
 from pathlib import Path
 root = Path(os.environ['TF_PRIVATE_DIR'])
@@ -340,7 +348,56 @@ if phone.get('GIDClientID') != os.environ['GOOGLE_CLIENT_ID']:
 schemes = [s for entry in phone.get('CFBundleURLTypes', []) for s in entry.get('CFBundleURLSchemes', [])]
 if '.'.join(reversed(os.environ['GOOGLE_CLIENT_ID'].split('.'))) not in schemes:
     raise SystemExit('The Google OAuth callback URL scheme is missing.')
-print('Verified the signed iPhone and companion Watch package for ' + os.environ['TF_BUILD_MODE'] + '.')
+
+def checked(command, label):
+    result = subprocess.run(command, capture_output=True)
+    if result.returncode:
+        # Tool diagnostics may include paths; never dump profile payloads.
+        detail = result.stderr.decode(errors='replace').replace(str(root), '[PRIVATE_RUNNER_DIRECTORY]')
+        raise SystemExit(label + ' failed. ' + detail[-1600:])
+    return result.stdout
+
+# ditto preserves bundle permissions and symlinks, unlike ZipFile.extractall.
+expanded = root / 'verified-export'
+checked(['ditto', '-x', '-k', str(packages[0]), str(expanded)], 'IPA extraction')
+apps = list((expanded / 'Payload').glob('*.app'))
+if len(apps) != 1:
+    raise SystemExit('The expanded IPA must contain one iPhone app.')
+watch_apps = list((apps[0] / 'Watch').glob('*.app'))
+if len(watch_apps) != 1:
+    raise SystemExit('The expanded iPhone app must embed one Watch app.')
+team = os.environ['APPLE_TEAM_ID']
+now = datetime.datetime.now(datetime.timezone.utc)
+for label, app, identifier in [('iPhone', apps[0], bundle),
+                               ('Watch', watch_apps[0], bundle + '.watchkitapp')]:
+    checked(['codesign', '--verify', '--deep', '--strict', str(app)], label + ' code signature verification')
+    try:
+        signature = plistlib.loads(checked(
+            ['codesign', '--display', '--entitlements', '-', '--xml', str(app)],
+            label + ' signed entitlements inspection'))
+        profile = plistlib.loads(checked(
+            ['security', 'cms', '-D', '-i', str(app / 'embedded.mobileprovision')],
+            label + ' embedded profile inspection'))
+    except plistlib.InvalidFileException:
+        raise SystemExit(label + ' signing metadata is not a valid property list.')
+    if (signature.get('com.apple.developer.team-identifier') != team
+            or team not in profile.get('TeamIdentifier', [])):
+        raise SystemExit(label + ' was not signed for the configured Apple team.')
+    profile_entitlements = profile.get('Entitlements', {})
+    app_id = signature.get('application-identifier')
+    prefixes = profile.get('ApplicationIdentifierPrefix', [])
+    if (not any(app_id == prefix + '.' + identifier for prefix in prefixes)
+            or profile_entitlements.get('application-identifier') != app_id):
+        raise SystemExit(label + ' signed application identifier does not match its bundle and profile.')
+    expiry = profile.get('ExpirationDate')
+    if expiry is None or expiry.replace(tzinfo=datetime.timezone.utc) <= now:
+        raise SystemExit(label + ' embedded provisioning profile has expired.')
+    if (signature.get('get-task-allow') or profile_entitlements.get('get-task-allow')
+            or 'ProvisionedDevices' in profile or profile.get('ProvisionsAllDevices')
+            or not profile_entitlements.get('beta-reports-active')):
+        raise SystemExit(label + ' must have App Store distribution signing, without development/debugger access.')
+print('Verified both App Store distribution signatures, teams, application identifiers and embedded profiles for '
+      + os.environ['TF_BUILD_MODE'] + '.')
 PY
 
 # Xcode's upload destination uses API-key authentication and the same archive.

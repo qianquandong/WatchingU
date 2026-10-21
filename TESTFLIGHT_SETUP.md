@@ -2,7 +2,7 @@
 
 The **TestFlight** GitHub Actions workflow runs manually on `main`. Its `build_mode` choice defaults to **google-drive**, which requires real Google OAuth configuration. Choose **local-recording** to test recording before Google setup is ready: Watch recording, reminders, fixed stop, Watch-to-iPhone transfer, playback and manual export are available for device testing; Drive upload and cloud-based previous-day cleanup are unavailable, and recordings remain on the iPhone. Both modes use the same bundle identifiers, so a later Drive build can upgrade the local test build.
 
-The workflow checks configuration, runs native CI checks, archives the iPhone app with its embedded Watch app, exports and verifies the signed IPA, and uploads the archive to App Store Connect using an API key. It does not publish an App Store release, invite testers, or submit an external beta review.
+The workflow checks configuration, runs native CI checks, archives the iPhone app with its embedded Watch app, exports the IPA, verifies both apps' actual distribution signatures, Team IDs, application identifiers and embedded App Store profiles, and uploads the archive to App Store Connect using an API key. It does not publish an App Store release, invite testers, or submit an external beta review.
 
 ## One-time account setup
 
@@ -66,7 +66,7 @@ On your Mac, copy a file's base64 directly to the clipboard, then paste it into 
 base64 -i /path/to/AuthKey_KEYID.p8 | pbcopy
 ```
 
-Automatic signing passes that API key to Xcode with `-allowProvisioningUpdates` for both archive and export. Xcode may create or download signing certificates and provisioning profiles for the two targets in your Apple team. If Apple account policy or key permissions prevent this, use the manual method; the workflow does not silently switch signing methods.
+With automatic signing, the archive is built with signing disabled. The App Store Connect export and upload steps then pass the API key to Xcode with `-allowProvisioningUpdates` and `signingStyle: automatic` to obtain distribution profiles and cloud signing for both targets. This avoids requiring development profiles or registered devices just to distribute a TestFlight build. Xcode may create or download signing certificates and distribution profiles in your Apple team. If Apple account policy or key permissions prevent this, use the manual method; the workflow does not silently switch signing methods. Manual signing continues to sign the archive with the supplied Apple Distribution certificate and two App Store profiles.
 
 ## Manual signing fallback
 
@@ -100,6 +100,8 @@ The standard `macos-15` runner selects the newest installed stable Xcode 26 or n
 - [Apple: upload builds](https://developer.apple.com/help/app-store-connect/manage-builds/upload-builds)
 - [Apple: current SDK upload requirements](https://developer.apple.com/news/upcoming-requirements/)
 - [Apple: distribute for beta testing and releases](https://developer.apple.com/documentation/xcode/distributing-your-app-for-beta-testing-and-releases)
+- [Apple WWDC21: API-key automation and cloud distribution signing](https://developer.apple.com/videos/play/wwdc2021/10204/)
+- [Apple: inspect code signing profiles and entitlements](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles)
 - [Apple: export from the command line](https://help.apple.com/xcode/mac/current/en.lproj/dev23ea8b877.html)
 - [fastlane: App Store Connect API authentication and TestFlight upload](https://docs.fastlane.tools/actions/upload_to_testflight/)
 - [GitHub CLI: set a secret from standard input](https://cli.github.com/manual/gh_secret_set)
