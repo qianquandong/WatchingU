@@ -19,3 +19,7 @@ __pycache__/
 .env.*
 Secrets.xcconfig
 Local.private.xcconfig
+
+# Local prototype validation snapshots
+SHA256SUMS.json
+validation-results.json

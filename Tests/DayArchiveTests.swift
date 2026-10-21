@@ -107,6 +107,14 @@ final class DayArchiveTests: XCTestCase {
         XCTAssertTrue(phone.dayIsBlocked("2026-10-18"))
         XCTAssertTrue(try phone.completeDays(accountID: account, policy: policy).isEmpty)
         XCTAssertTrue(phone.hasLocalAudio(first.id)); XCTAssertTrue(phone.hasLocalAudio(late.id))
+        let reopened = try ClipStore(root: phone.root)
+        XCTAssertTrue(reopened.dayIsBlocked("2026-10-18"))
+        XCTAssertTrue(try reopened.completeDays(accountID: account, policy: policy).isEmpty)
+        XCTAssertTrue(reopened.hasLocalAudio(first.id)); XCTAssertTrue(reopened.hasLocalAudio(late.id))
+        // A duplicate of the original seal cannot erase evidence of the late segment.
+        try deliver(closure([first]), to: reopened)
+        XCTAssertTrue(reopened.dayIsBlocked("2026-10-18"))
+        XCTAssertTrue(try reopened.completeDays(accountID: account, policy: policy).isEmpty)
     }
 
     func testConflictingClosureRevisionIsPersistentlyBlocked() throws {

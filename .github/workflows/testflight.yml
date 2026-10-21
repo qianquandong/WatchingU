@@ -1,0 +1,82 @@
+name: TestFlight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+      DAYTAPE_BUNDLE_PREFIX: ${{ vars.DAYTAPE_BUNDLE_PREFIX }}
+      GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_CLIENT_ID }}
+      APPLE_SIGNING_STYLE: ${{ vars.APPLE_SIGNING_STYLE || 'automatic' }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Select an installed stable Xcode
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import plistlib
+          import re
+          from pathlib import Path
+
+          candidates = []
+          for app in Path('/Applications').glob('Xcode*.app'):
+              if any(word in app.name.lower() for word in ('beta', 'preview', '_rc')):
+                  continue
+              developer = app / 'Contents' / 'Developer'
+              if not (developer / 'usr/bin/xcodebuild').is_file():
+                  continue
+              with (app / 'Contents/Info.plist').open('rb') as stream:
+                  info = plistlib.load(stream)
+              version_text = info.get('CFBundleShortVersionString', '')
+              if not re.fullmatch(r'\d+(?:\.\d+)*', version_text):
+                  continue
+              version = tuple(int(part) for part in version_text.split('.'))
+              if version >= (26, 0):
+                  candidates.append((version, str(developer.resolve())))
+          if not candidates:
+              raise SystemExit('TestFlight upload requires an installed stable Xcode 26 or newer.')
+          version, developer = max(candidates)
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write(f'DEVELOPER_DIR={developer}\n')
+          print('Selected Xcode', '.'.join(map(str, version)), developer)
+          PY
+
+      - name: Check configuration, build, and upload to TestFlight
+        shell: bash
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64 }}
+          APPLE_DISTRIBUTION_P12_BASE64: ${{ secrets.APPLE_DISTRIBUTION_P12_BASE64 }}
+          APPLE_DISTRIBUTION_P12_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_P12_PASSWORD }}
+          APPLE_PROVISION_PROFILE_IOS_BASE64: ${{ secrets.APPLE_PROVISION_PROFILE_IOS_BASE64 }}
+          APPLE_PROVISION_PROFILE_WATCH_BASE64: ${{ secrets.APPLE_PROVISION_PROFILE_WATCH_BASE64 }}
+        run: bash Scripts/testflight.sh
+
+      # Signed products and signing files stay in RUNNER_TEMP, outside artifacts.
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: testflight-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0

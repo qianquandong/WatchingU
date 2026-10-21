@@ -60,6 +60,8 @@ OAuth客户端、URL scheme、Drive API和发布配置是**开发者在应用上
 
 仓库：[qianquandong/WatchingU](https://github.com/qianquandong/WatchingU)。每次推送 main 或创建 PR，Native CI 会在 macOS 上运行 C 断言、35 个 Swift 存储与日期测试，以及 iPhone / Watch 模拟器无签名编译。编译日志和 xcresult 保存在对应 Actions 运行的 artifacts 中。CI 通过仅证明这些测试与编译通过，配对真机、后台调度与续航仍需 TestFlight 验收。
 
+TestFlight 签名、GitHub Secrets 与上传步骤见 [TESTFLIGHT_SETUP.md](TESTFLIGHT_SETUP.md)。
+
 ## 在 Mac 安装
 
 1. 解压，双击 DayTape.xcodeproj。无需 XcodeGen；Xcode 会用 Swift Package Manager 解析固定 GoogleSignIn 10.0.0 及依赖，需要联网。

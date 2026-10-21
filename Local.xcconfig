@@ -1,6 +1,6 @@
 // Select your own Team for both targets. Never put a Google client secret here.
 DAYTAPE_BUNDLE_PREFIX = com.aimanjack.daytape
-DEVELOPMENT_TEAM =
+DEVELOPMENT_TEAM = GB24TMUMQ5
 GOOGLE_CLIENT_ID = configure.apps.googleusercontent.com
 GOOGLE_REVERSED_CLIENT_ID = com.googleusercontent.apps.configure
 // Fixed-time routine needs no HealthKit. Leave this flag empty.

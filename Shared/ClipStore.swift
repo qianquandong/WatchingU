@@ -171,9 +171,8 @@ final class ClipStore {
             var canonical = clip; canonical.attempts = 0; canonical.retryAfter = .distantPast
             try save(canonical, at: manifestURL(clip.id))
             cachedIndex?[clip.id] = canonical
-            #if os(iOS)
+            // Closure integrity is part of the shared storage protocol on every platform.
             try checkIncomingClipAgainstClosure(canonical)
-            #endif
             // No acknowledgement is emitted if either audio or manifest persistence failed.
             return Receipt(clip: canonical)
         }
