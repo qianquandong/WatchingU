@@ -2,7 +2,7 @@
 
 独立编写的原生 Apple Watch + iPhone 源码原型。没有使用 Auday 的安装包、反编译代码或素材。
 
-**状态：待 Mac 编译与配对真机验收。当前 Linux 环境没有 Xcode、Apple SDK 或手表，不能宣称已安装、已设置系统提醒、已连接 Google、已测试全天续航或后台上传。**
+**状态：GitHub macOS CI 已通过 iPhone／Watch 模拟器编译、35 项 Swift 测试与 40,045 条 C 断言。待 TestFlight 签名上传和配对真机验收；尚未连接真实 Google Drive，也未验证全天续航或后台上传。**
 
 ## 已按用户选择配置的流程
 
@@ -64,7 +64,7 @@ TestFlight 签名、GitHub Secrets 与上传步骤见 [TESTFLIGHT_SETUP.md](TEST
 
 ## 在 Mac 安装
 
-1. 解压，双击 DayTape.xcodeproj。无需 XcodeGen；Xcode 会用 Swift Package Manager 解析固定 GoogleSignIn 10.0.0 及依赖，需要联网。
+1. 克隆本仓库，双击 DayTape.xcodeproj。无需 XcodeGen；Xcode 会用 Swift Package Manager 解析固定 GoogleSignIn 10.0.0 及依赖，需要联网。
 2. 使用支持你的 iPhone / Watch 系统及 SDK 依赖的 Xcode。部署目标 iOS 17、watchOS 10。Intel Mac 能否使用取决于具体型号、macOS 和可安装的 Xcode。
 3. 修改 Local.xcconfig 的 DAYTAPE_BUNDLE_PREFIX 为你自己的唯一 Bundle 前缀。在两个 target 的 Signing & Capabilities 选同一 Team，自动签名。
 4. 按 CLOUD_SETUP.md 创建 Google iOS OAuth 客户端，填入客户端 ID 和反向 URL scheme。无需在 App 内保存 client secret，不需要自建服务器。

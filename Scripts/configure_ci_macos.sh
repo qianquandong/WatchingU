@@ -14,6 +14,8 @@ for tool in gh python3 openssl; do
 done
 
 REPOSITORY=qianquandong/WatchingU
+# Pin every gh call to the intended host even if the Mac uses enterprise gh.
+export GH_HOST=github.com
 export APPLE_TEAM_ID="${APPLE_TEAM_ID:-GB24TMUMQ5}"
 export DAYTAPE_BUNDLE_PREFIX="${DAYTAPE_BUNDLE_PREFIX:-com.aimanjack.daytape}"
 export APP_STORE_CONNECT_API_KEY_ID="${4:-${APP_STORE_CONNECT_API_KEY_ID:-}}"
