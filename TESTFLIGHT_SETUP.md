@@ -1,6 +1,8 @@
 # TestFlight setup
 
-The **TestFlight** GitHub Actions workflow runs manually on `main`. It checks configuration, runs the native CI checks, archives the iPhone app with its embedded Watch app, exports and verifies the signed IPA, and uploads the archive to App Store Connect using an API key. It does not publish an App Store release, invite testers, or submit an external beta review.
+The **TestFlight** GitHub Actions workflow runs manually on `main`. Its `build_mode` choice defaults to **google-drive**, which requires real Google OAuth configuration. Choose **local-recording** to test recording before Google setup is ready: Watch recording, reminders, fixed stop, Watch-to-iPhone transfer, playback and manual export are available for device testing; Drive upload and cloud-based previous-day cleanup are unavailable, and recordings remain on the iPhone. Both modes use the same bundle identifiers, so a later Drive build can upgrade the local test build.
+
+The workflow checks configuration, runs native CI checks, archives the iPhone app with its embedded Watch app, exports and verifies the signed IPA, and uploads the archive to App Store Connect using an API key. It does not publish an App Store release, invite testers, or submit an external beta review.
 
 ## One-time account setup
 
@@ -23,7 +25,7 @@ Open repository **Settings → Secrets and variables → Actions → Variables**
 | --- | --- |
 | `APPLE_TEAM_ID` | Your 10-character Apple Developer Team ID |
 | `DAYTAPE_BUNDLE_PREFIX` | The registered iPhone bundle identifier |
-| `GOOGLE_CLIENT_ID` | The Google iOS OAuth client ID ending in `.apps.googleusercontent.com` |
+| `GOOGLE_CLIENT_ID` | A real Google iOS OAuth client ID; required for `google-drive`, unused for `local-recording` |
 | `APPLE_SIGNING_STYLE` | `automatic` (default), or `manual` for the certificate/profile method below |
 
 The Google reversed client ID is derived automatically. The scheduled recording/backup version uses the entitlement file without HealthKit.
@@ -37,6 +39,14 @@ bash Scripts/configure_ci_macos.sh "/path/to/AuthKey_KEYID.p8" "YOUR_REAL_GOOGLE
 ```
 
 Supply the original `.p8` downloaded for that key and the real Google iOS client ID. The helper infers the Key ID from the original `AuthKey_KEYID.p8` filename and prompts for the team's Issuer ID; alternatively pass the Issuer ID as the third argument and Key ID as the fourth, or set `APP_STORE_CONNECT_API_ISSUER_ID` / `APP_STORE_CONNECT_API_KEY_ID` in your environment. Omitting the first two arguments prompts for them. The helper defaults to team `GB24TMUMQ5` and bundle prefix `com.aimanjack.daytape`, validates the file/configuration, and writes the three secrets and three required variables using standard input. It never prints the private key or starts the TestFlight workflow. Keep `APPLE_SIGNING_STYLE` unset or `automatic` for this setup. The App Store Connect app record must exist before running TestFlight.
+
+To configure Apple signing first without a Google client ID:
+
+```bash
+bash Scripts/configure_ci_macos.sh --signing-only "/path/to/AuthKey_KEYID.p8"
+```
+
+This prompts for the Issuer ID, or accepts it as the next argument (and an optional Key ID after that). It writes the three Apple secrets and the Team/bundle variables only. Then select `local-recording` in the manual workflow; no workflow starts automatically. This mode forces the app's existing unconfigured Google sentinel even if a Google variable already exists. The app's backup option reports that cloud backup is unavailable; keep it off during this local test. Run the normal helper later with a real Google client ID and choose `google-drive` to test backup.
 
 ## App Store Connect API secrets
 
@@ -75,7 +85,7 @@ Use the same `base64 -i /path/to/file | pbcopy` command for each file. Keep sign
 
 ## Upload and install
 
-1. Open **Actions → TestFlight → Run workflow**, select `main`, and run it. Only a manual run on `main` can reach signing and upload.
+1. Open **Actions → TestFlight → Run workflow**, select `main`, choose `google-drive` (default) or `local-recording`, and run it. Only a manual run on `main` can reach signing and upload.
 2. The workflow assigns a matching iPhone/Watch build number from `run_number.run_attempt`. If an existing App Store Connect build has a higher number, increase the project's marketing version or adjust the numbering before another upload.
 3. After upload, open the app's **App Store Connect → TestFlight** page and wait for Apple's processing. A green workflow reports upload acceptance; it does not prove Apple processing succeeded.
 4. Complete any export-compliance or test-information requests, add yourself to an internal testing group, and install with TestFlight on the paired iPhone. Enable/install the companion app in the iPhone Watch app if needed. External testing may require Apple's beta review.

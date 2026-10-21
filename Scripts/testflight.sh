@@ -10,6 +10,16 @@ fail() { printf '%s\n' "TestFlight: $*" >&2; exit 1; }
 [[ "${GITHUB_ACTIONS:-}" == true && "${GITHUB_REF:-}" == refs/heads/main ]] || fail 'Run the manual TestFlight workflow on main.'
 [[ -n "${RUNNER_TEMP:-}" ]] || fail 'RUNNER_TEMP is required.'
 export APPLE_SIGNING_STYLE="${APPLE_SIGNING_STYLE:-automatic}"
+export TF_BUILD_MODE="${TF_BUILD_MODE:-google-drive}"
+case "$TF_BUILD_MODE" in
+  google-drive) printf '%s\n' 'Build mode: Google Drive backup. A real Google iOS OAuth client is required.' ;;
+  local-recording)
+    # This existing sentinel makes DriveConnection.configured false at runtime.
+    export GOOGLE_CLIENT_ID=configure.apps.googleusercontent.com
+    printf '%s\n' 'Build mode: local recording only. No Google Drive upload or cloud-based local cleanup; recordings remain on the iPhone.'
+    ;;
+  *) fail 'TF_BUILD_MODE must be google-drive or local-recording.' ;;
+esac
 
 # Validate names and values without printing credentials or decoded material.
 python3 - <<'PY'
@@ -19,9 +29,11 @@ import os
 import re
 import uuid
 
-required = ['APPLE_TEAM_ID', 'DAYTAPE_BUNDLE_PREFIX', 'GOOGLE_CLIENT_ID',
+required = ['APPLE_TEAM_ID', 'DAYTAPE_BUNDLE_PREFIX',
             'APP_STORE_CONNECT_API_KEY_ID', 'APP_STORE_CONNECT_API_ISSUER_ID',
             'APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64']
+if os.environ['TF_BUILD_MODE'] == 'google-drive':
+    required.append('GOOGLE_CLIENT_ID')
 style = os.environ['APPLE_SIGNING_STYLE']
 if style not in ('automatic', 'manual'):
     raise SystemExit('APPLE_SIGNING_STYLE must be automatic or manual.')
@@ -34,9 +46,10 @@ if missing:
 patterns = {
     'APPLE_TEAM_ID': r'[A-Z0-9]{10}',
     'DAYTAPE_BUNDLE_PREFIX': r'[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+){2,}',
-    'GOOGLE_CLIENT_ID': r'[0-9]+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com',
     'APP_STORE_CONNECT_API_KEY_ID': r'[A-Z0-9]{10}',
 }
+if os.environ['TF_BUILD_MODE'] == 'google-drive':
+    patterns['GOOGLE_CLIENT_ID'] = r'[0-9]+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com'
 for name, pattern in patterns.items():
     if not re.fullmatch(pattern, os.environ[name]):
         raise SystemExit('Invalid or placeholder value for ' + name)
@@ -54,7 +67,7 @@ for name in required:
             raise SystemExit('Empty decoded value in ' + name)
         if name == 'APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64' and b'-----BEGIN PRIVATE KEY-----' not in decoded:
             raise SystemExit('The App Store Connect API secret must contain the downloaded .p8 private key.')
-print('Required signing and Google OAuth configuration is present.')
+print('Required configuration is present for build mode ' + os.environ['TF_BUILD_MODE'] + '.')
 PY
 
 # Since April 28, 2026 Apple requires Xcode 26+ and current platform SDKs
@@ -323,11 +336,11 @@ for info in [phone, watch]:
     if info.get('CFBundleVersion') != os.environ['TF_BUILD_NUMBER']:
         raise SystemExit('The iPhone and Watch build numbers must match this workflow run.')
 if phone.get('GIDClientID') != os.environ['GOOGLE_CLIENT_ID']:
-    raise SystemExit('The exported Google OAuth client ID is missing or incorrect.')
+    raise SystemExit('The exported client configuration does not match the selected build mode.')
 schemes = [s for entry in phone.get('CFBundleURLTypes', []) for s in entry.get('CFBundleURLSchemes', [])]
 if '.'.join(reversed(os.environ['GOOGLE_CLIENT_ID'].split('.'))) not in schemes:
     raise SystemExit('The Google OAuth callback URL scheme is missing.')
-print('Verified the signed iPhone and companion Watch package.')
+print('Verified the signed iPhone and companion Watch package for ' + os.environ['TF_BUILD_MODE'] + '.')
 PY
 
 # Xcode's upload destination uses API-key authentication and the same archive.
@@ -339,6 +352,10 @@ run_private upload xcodebuild -exportArchive \
   -allowProvisioningUpdates "${authentication[@]}"
 printf '%s\n' 'Upload accepted by App Store Connect. Apple processing must finish before TestFlight can install the build.'
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-  printf 'Uploaded DayTape build **%s** to App Store Connect. Apple processing is still required; check TestFlight for the final status.\n' \
-    "$TF_BUILD_NUMBER" >> "$GITHUB_STEP_SUMMARY"
+  printf 'Uploaded DayTape build **%s** (%s) to App Store Connect. Apple processing is still required; check TestFlight for the final status.\n' \
+    "$TF_BUILD_NUMBER" "$TF_BUILD_MODE" >> "$GITHUB_STEP_SUMMARY"
+  if [[ "$TF_BUILD_MODE" == local-recording ]]; then
+    printf '\nLocal recording only: Google Drive upload and cloud-based local cleanup are unavailable. Recordings remain on the iPhone.\n' \
+      >> "$GITHUB_STEP_SUMMARY"
+  fi
 fi

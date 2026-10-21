@@ -8,7 +8,14 @@ umask 077
 fail() { printf '%s\n' "CI setup: $*" >&2; exit 1; }
 [[ "$(uname -s)" == Darwin ]] || fail 'Run this helper on your Mac.'
 [[ "${GITHUB_ACTIONS:-}" != true ]] || fail 'This one-time helper is for your Mac, not a CI runner.'
-[[ "$#" -le 4 ]] || fail 'Usage: bash Scripts/configure_ci_macos.sh /path/to/AuthKey_KEYID.p8 GOOGLE_IOS_CLIENT_ID [ISSUER_ID] [KEY_ID]'
+export CI_SIGNING_ONLY=false
+if [[ "${1:-}" == --signing-only ]]; then
+  CI_SIGNING_ONLY=true
+  shift
+  [[ "$#" -le 3 ]] || fail 'Usage: bash Scripts/configure_ci_macos.sh --signing-only /path/to/AuthKey_KEYID.p8 [ISSUER_ID] [KEY_ID]'
+else
+  [[ "$#" -le 4 ]] || fail 'Usage: bash Scripts/configure_ci_macos.sh /path/to/AuthKey_KEYID.p8 GOOGLE_IOS_CLIENT_ID [ISSUER_ID] [KEY_ID]'
+fi
 for tool in gh python3 openssl; do
   command -v "$tool" >/dev/null 2>&1 || fail "Install ${tool} before running this helper."
 done
@@ -18,15 +25,21 @@ REPOSITORY=qianquandong/WatchingU
 export GH_HOST=github.com
 export APPLE_TEAM_ID="${APPLE_TEAM_ID:-GB24TMUMQ5}"
 export DAYTAPE_BUNDLE_PREFIX="${DAYTAPE_BUNDLE_PREFIX:-com.aimanjack.daytape}"
-export APP_STORE_CONNECT_API_KEY_ID="${4:-${APP_STORE_CONNECT_API_KEY_ID:-}}"
-export APP_STORE_CONNECT_API_ISSUER_ID="${3:-${APP_STORE_CONNECT_API_ISSUER_ID:-}}"
 KEY_PATH="${1:-}"
-export GOOGLE_CLIENT_ID="${2:-}"
+if [[ "$CI_SIGNING_ONLY" == true ]]; then
+  export APP_STORE_CONNECT_API_KEY_ID="${3:-${APP_STORE_CONNECT_API_KEY_ID:-}}"
+  export APP_STORE_CONNECT_API_ISSUER_ID="${2:-${APP_STORE_CONNECT_API_ISSUER_ID:-}}"
+  export GOOGLE_CLIENT_ID=
+else
+  export APP_STORE_CONNECT_API_KEY_ID="${4:-${APP_STORE_CONNECT_API_KEY_ID:-}}"
+  export APP_STORE_CONNECT_API_ISSUER_ID="${3:-${APP_STORE_CONNECT_API_ISSUER_ID:-}}"
+  export GOOGLE_CLIENT_ID="${2:-}"
+fi
 if [[ -z "$KEY_PATH" ]]; then
   [[ -t 0 ]] || fail 'Supply the path to the existing GitHub CI API key .p8 file.'
   read -r -p 'Path to the existing GitHub CI AuthKey .p8 file: ' KEY_PATH
 fi
-if [[ -z "$GOOGLE_CLIENT_ID" ]]; then
+if [[ "$CI_SIGNING_ONLY" == false && -z "$GOOGLE_CLIENT_ID" ]]; then
   [[ -t 0 ]] || fail 'Supply the real Google iOS OAuth client ID as the second argument.'
   read -r -p 'Google iOS OAuth client ID: ' GOOGLE_CLIENT_ID
 fi
@@ -40,7 +53,7 @@ if [[ -z "$APP_STORE_CONNECT_API_KEY_ID" ]]; then
   fi
 fi
 if [[ -z "$APP_STORE_CONNECT_API_ISSUER_ID" ]]; then
-  [[ -t 0 ]] || fail 'Supply the App Store Connect Issuer ID as the third argument or APP_STORE_CONNECT_API_ISSUER_ID.'
+  [[ -t 0 ]] || fail 'Supply the App Store Connect Issuer ID argument or APP_STORE_CONNECT_API_ISSUER_ID.'
   read -r -p 'App Store Connect API Issuer ID: ' APP_STORE_CONNECT_API_ISSUER_ID
 fi
 
@@ -54,9 +67,10 @@ import uuid
 patterns = {
     'APPLE_TEAM_ID': r'[A-Z0-9]{10}',
     'DAYTAPE_BUNDLE_PREFIX': r'[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+){2,}',
-    'GOOGLE_CLIENT_ID': r'[0-9]+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com',
     'APP_STORE_CONNECT_API_KEY_ID': r'[A-Z0-9]{10}',
 }
+if os.environ['CI_SIGNING_ONLY'] != 'true':
+    patterns['GOOGLE_CLIENT_ID'] = r'[0-9]+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com'
 for name, pattern in patterns.items():
     if not re.fullmatch(pattern, os.environ[name]):
         raise SystemExit('Invalid or placeholder value for ' + name)
@@ -94,5 +108,9 @@ sys.stdout.write(base64.b64encode(Path(sys.argv[1]).read_bytes()).decode('ascii'
 PY
 printf '%s' "$APPLE_TEAM_ID" | gh variable set APPLE_TEAM_ID --repo "$REPOSITORY"
 printf '%s' "$DAYTAPE_BUNDLE_PREFIX" | gh variable set DAYTAPE_BUNDLE_PREFIX --repo "$REPOSITORY"
-printf '%s' "$GOOGLE_CLIENT_ID" | gh variable set GOOGLE_CLIENT_ID --repo "$REPOSITORY"
-printf '%s\n' 'Configured 3 secrets and 3 variables. No workflow was started.'
+if [[ "$CI_SIGNING_ONLY" == true ]]; then
+  printf '%s\n' 'Configured 3 Apple signing secrets and 2 variables. Google configuration was not changed. No workflow was started.'
+else
+  printf '%s' "$GOOGLE_CLIENT_ID" | gh variable set GOOGLE_CLIENT_ID --repo "$REPOSITORY"
+  printf '%s\n' 'Configured 3 secrets and 3 variables. No workflow was started.'
+fi

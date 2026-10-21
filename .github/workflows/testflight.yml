@@ -2,6 +2,15 @@ name: TestFlight
 
 on:
   workflow_dispatch:
+    inputs:
+      build_mode:
+        description: Build with Google Drive backup or test local recording only
+        type: choice
+        required: true
+        default: google-drive
+        options:
+          - google-drive
+          - local-recording
 
 permissions:
   contents: read
@@ -16,6 +25,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 45
     env:
+      TF_BUILD_MODE: ${{ inputs.build_mode || 'google-drive' }}
       APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
       DAYTAPE_BUNDLE_PREFIX: ${{ vars.DAYTAPE_BUNDLE_PREFIX }}
       GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_CLIENT_ID }}
