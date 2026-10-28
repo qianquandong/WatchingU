@@ -13,6 +13,9 @@ https://developer.apple.com/documentation/appstoreconnectapi/internalbetastate
 https://developer.apple.com/documentation/appstoreconnectapi/post-v1-builds-_id_-relationships-betagroups
 https://developer.apple.com/documentation/appstoreconnectapi/patch-v1-builds-_id_
 https://developer.apple.com/documentation/appstoreconnectapi/post-v1-betatesterinvitations
+https://developer.apple.com/documentation/appstoreconnectapi/get-v1-bundleids
+https://developer.apple.com/documentation/appstoreconnectapi/get-v1-bundleids-_id_-bundleidcapabilities
+https://developer.apple.com/documentation/appstoreconnectapi/get-v1-bundleids-_id_-profiles
 https://developer.apple.com/help/app-store-connect/test-a-beta-version/add-internal-testers/
 """
 from __future__ import annotations
@@ -259,6 +262,56 @@ def inspect_inventory(api, options):
     return report
 
 
+def inspect_provisioning(api, options):
+    """Read only exact bundle IDs and profile metadata; never fetch signing data."""
+    prefix = options.bundle_id
+    report = {"mode": "inspect-provisioning", "bundles": []}
+    for target, suffix in (("Phone", ""), ("Watch", ".watchkitapp"),
+            ("PhoneWidget", ".widgets"), ("WatchWidget", ".watchkitapp.widgets")):
+        bundle = prefix + suffix
+        item = {"target": target, "identifier": safe_name(bundle), "exists": None}
+        report["bundles"].append(item)
+        try:
+            found = api.listing("/v1/bundleIds", {"filter[identifier]": bundle,
+                "fields[bundleIds]": "identifier,seedId", "limit": 2})
+        except APIError as error:
+            if error.status != 403:
+                raise
+            item.update(bundle_metadata_readable=False, reason="API_KEY_CANNOT_READ_BUNDLE_IDS")
+            continue
+        matches = [b for b in found if attributes(b).get("identifier") == bundle]
+        if len(matches) > 1:
+            raise AccessError("Exact bundle identifier lookup returned multiple resources.")
+        item.update(exists=bool(matches), bundle_metadata_readable=True)
+        if not matches:
+            continue
+        bid = identifier(matches[0]["id"])
+        seed = attributes(matches[0]).get("seedId")
+        item.update(bundle_resource_id=bid, seed_id=None if seed is None else safe_name(seed))
+        try:
+            capabilities = api.listing(f"/v1/bundleIds/{bid}/bundleIdCapabilities",
+                {"fields[bundleIdCapabilities]": "capabilityType", "limit": 200})
+            item.update(capabilities_readable=True, capability_types=sorted({
+                safe_name(attributes(c).get("capabilityType", "UNKNOWN")) for c in capabilities}))
+        except APIError as error:
+            if error.status != 403:
+                raise
+            item.update(capabilities_readable=False, capabilities_reason="API_KEY_CANNOT_READ_CAPABILITIES")
+        try:
+            profiles = api.listing(f"/v1/bundleIds/{bid}/profiles",
+                {"fields[profiles]": "profileType,profileState", "limit": 200})
+            counts = Counter((safe_name(attributes(p).get("profileType", "UNKNOWN")),
+                safe_name(attributes(p).get("profileState", "UNKNOWN"))) for p in profiles)
+            item.update(profile_metadata_readable=True, profile_count=len(profiles),
+                profile_type_state_counts=[{"type": kind, "state": state, "count": count}
+                    for (kind, state), count in sorted(counts.items())])
+        except APIError as error:
+            if error.status != 403:
+                raise
+            item.update(profile_metadata_readable=False, profiles_reason="API_KEY_CANNOT_READ_PROFILE_METADATA")
+    return report
+
+
 def invite_existing_owner(api, app_id, group, attempted):
     """Prove membership and owner equality in CI; return only state/count metadata."""
     if attributes(group).get("isInternalGroup") is not True:
@@ -401,7 +454,7 @@ def inspect_access(api, options):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("inspect", "check", "ensure"), default="check")
+    parser.add_argument("--mode", choices=("inspect", "inspect-provisioning", "check", "ensure"), default="check")
     parser.add_argument("--bundle-id", default=os.environ.get("DAYTAPE_BUNDLE_PREFIX", "com.aimanjack.daytape"))
     parser.add_argument("--build-number", default=os.environ.get("TF_BUILD_NUMBER"))
     parser.add_argument("--marketing-version", default="0.5.0")
@@ -427,6 +480,9 @@ def main(argv=None):
         api = ASC()
         if options.mode == "inspect":
             print(json.dumps(inspect_inventory(api, options), ensure_ascii=True, sort_keys=True), flush=True)
+            return 0
+        if options.mode == "inspect-provisioning":
+            print(json.dumps(inspect_provisioning(api, options), ensure_ascii=True, sort_keys=True), flush=True)
             return 0
         deadline = time.monotonic() + options.timeout_seconds
         previous = None

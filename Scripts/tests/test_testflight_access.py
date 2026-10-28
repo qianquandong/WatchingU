@@ -81,6 +81,33 @@ class FakeASC:
         raise AssertionError("Unexpected API mutation")
 
 
+class FakeProvisioningASC:
+    def __init__(self):
+        self.calls = []
+        self.denied = set()
+        prefix = "com.aimanjack.daytape"
+        self.bundles = {prefix + suffix: resource("bundleIds", "bundle" + str(i),
+            identifier=prefix + suffix, seedId="TEAM123456")
+            for i, suffix in enumerate(("", ".watchkitapp", ".widgets", ".watchkitapp.widgets"))}
+
+    def listing(self, path, params=None):
+        self.calls.append(("GET", path, params))
+        if path in self.denied:
+            raise tf.APIError(403)
+        if path == "/v1/bundleIds":
+            entry = self.bundles.get(params["filter[identifier]"])
+            return [entry] if entry else []
+        if path.endswith("/bundleIdCapabilities"):
+            return [resource("bundleIdCapabilities", "c1", capabilityType="APP_GROUPS"),
+                resource("bundleIdCapabilities", "c2", capabilityType="HEALTHKIT")]
+        if path.endswith("/profiles"):
+            # Even if extra sensitive attributes were returned, the report must not echo them.
+            return [resource("profiles", "p1", profileType="IOS_APP_STORE", profileState="ACTIVE", profileContent="SECRET_PROFILE"),
+                resource("profiles", "p2", profileType="IOS_APP_STORE", profileState="ACTIVE", certificates=["SECRET_CERT"]),
+                resource("profiles", "p3", profileType="IOS_APP_DEVELOPMENT", profileState="INVALID")]
+        raise AssertionError("Unexpected provisioning endpoint")
+
+
 class TestFlightAccessTests(unittest.TestCase):
     def test_inventory_needs_no_build_and_never_logs_full_identity(self):
         api = FakeASC()
@@ -98,6 +125,44 @@ class TestFlightAccessTests(unittest.TestCase):
         report = tf.inspect_inventory(api, options())
         self.assertFalse(report["users_readable"])
         self.assertIsNone(report["account_holder_count"])
+
+    def test_provisioning_inventory_queries_four_exact_bundles_and_only_safe_metadata(self):
+        api = FakeProvisioningASC()
+        report = tf.inspect_provisioning(api, options(mode="inspect-provisioning", build_number=None))
+        prefix = "com.aimanjack.daytape"
+        self.assertEqual([c[2]["filter[identifier]"] for c in api.calls if c[1] == "/v1/bundleIds"],
+            [prefix, prefix + ".watchkitapp", prefix + ".widgets", prefix + ".watchkitapp.widgets"])
+        self.assertEqual(len(report["bundles"]), 4)
+        self.assertTrue(all(b["exists"] and b["seed_id"] == "TEAM123456" for b in report["bundles"]))
+        self.assertEqual(report["bundles"][0]["capability_types"], ["APP_GROUPS", "HEALTHKIT"])
+        self.assertEqual(report["bundles"][0]["profile_type_state_counts"], [
+            {"type": "IOS_APP_DEVELOPMENT", "state": "INVALID", "count": 1},
+            {"type": "IOS_APP_STORE", "state": "ACTIVE", "count": 2}])
+        self.assertTrue(all(method == "GET" for method, _, _ in api.calls))
+        for _, path, query in api.calls:
+            self.assertNotIn("appGroups", path)
+            self.assertNotIn("profileContent", str(query))
+            self.assertNotIn("certificates", str(query))
+        self.assertNotIn("SECRET", json.dumps(report))
+
+    def test_absent_bundle_is_reported_without_requesting_capabilities_or_profiles(self):
+        api = FakeProvisioningASC(); api.bundles.clear()
+        report = tf.inspect_provisioning(api, options(mode="inspect-provisioning"))
+        self.assertTrue(all(b["exists"] is False for b in report["bundles"]))
+        self.assertEqual(len(api.calls), 4)
+        self.assertTrue(all(c[1] == "/v1/bundleIds" for c in api.calls))
+
+    def test_forbidden_provisioning_metadata_is_distinct_from_absent_or_empty(self):
+        api = FakeProvisioningASC(); api.denied.add("/v1/bundleIds")
+        report = tf.inspect_provisioning(api, options(mode="inspect-provisioning"))
+        self.assertTrue(all(b["exists"] is None and not b["bundle_metadata_readable"] for b in report["bundles"]))
+        api = FakeProvisioningASC()
+        api.denied.update(["/v1/bundleIds/bundle0/bundleIdCapabilities", "/v1/bundleIds/bundle0/profiles"])
+        report = tf.inspect_provisioning(api, options(mode="inspect-provisioning"))
+        self.assertTrue(report["bundles"][0]["exists"])
+        self.assertFalse(report["bundles"][0]["capabilities_readable"])
+        self.assertFalse(report["bundles"][0]["profile_metadata_readable"])
+        self.assertTrue(report["bundles"][1]["capabilities_readable"])
 
     def test_processed_but_unassigned_build_is_not_ready_and_check_cannot_mutate(self):
         api = FakeASC(); api.assigned["g1"] = []

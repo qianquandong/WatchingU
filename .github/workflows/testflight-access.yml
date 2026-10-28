@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Read-only inventory/check, or enable the exact uploaded build for existing internal testers
+        description: Read-only testers/provisioning inventory, check, or enable the exact build for existing internal testers
         type: choice
         required: true
         default: inspect
-        options: [inspect, check, ensure]
+        options: [inspect, inspect-provisioning, check, ensure]
       build_number:
         description: Exact CFBundleVersion; required for ensure
         type: string
@@ -30,7 +30,7 @@ on:
         type: boolean
         default: false
       wait_minutes:
-        description: Maximum processing/access wait; inspect never waits
+        description: Maximum processing/access wait; inventory modes never wait
         type: choice
         default: '45'
         options: ['0', '15', '45', '90']
