@@ -113,6 +113,7 @@ final class WatchRecorder: ObservableObject {
         } catch { notice = "无法读取位置设置，继续仅录音。" }
     }
     private func publishWidget(reload: Bool) {
+        guard AppBuildFeatures.widgetsAvailable else { return }
         let label: String
         switch phase {
         case .idle: label = "准备好了"

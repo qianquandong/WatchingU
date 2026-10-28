@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Generate the four-target Xcode project deterministically on Windows or macOS."""
 from pathlib import Path
+import argparse
 import hashlib
 import json
 import plistlib
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--feature-set", choices=["full", "core-testing"], default="full",
+                    help="Explicit release capabilities; full remains the default.")
+FEATURE_SET = parser.parse_args().feature_set
+CORE_TESTING = FEATURE_SET == "core-testing"
 objects = {}
 
 
@@ -45,7 +51,8 @@ base_info = dict(CFBundleDevelopmentRegion="en", CFBundleExecutable="$(EXECUTABL
     CFBundleIdentifier="$(PRODUCT_BUNDLE_IDENTIFIER)", CFBundleInfoDictionaryVersion="6.0",
     CFBundleName="$(PRODUCT_NAME)", CFBundleDisplayName="DayTape", CFBundlePackageType="APPL",
     CFBundleShortVersionString="$(MARKETING_VERSION)", CFBundleVersion="$(CURRENT_PROJECT_VERSION)",
-    ITSAppUsesNonExemptEncryption=False, DayTapeAppGroup="$(DAYTAPE_APP_GROUP)")
+    ITSAppUsesNonExemptEncryption=False, DayTapeAppGroup="" if CORE_TESTING else "$(DAYTAPE_APP_GROUP)",
+    DayTapeFeatureSet=FEATURE_SET)
 phone_info = dict(base_info, UILaunchScreen={}, UISupportedInterfaceOrientations=["UIInterfaceOrientationPortrait"],
     UIApplicationSceneManifest={"UIApplicationSupportsMultipleScenes": False},
     GIDClientID="$(GOOGLE_CLIENT_ID)", CFBundleURLTypes=[
@@ -62,6 +69,8 @@ watch_info = dict(base_info, WKApplication=True, WKCompanionAppBundleIdentifier=
     NSMicrophoneUsageDescription="在你点击开始后录制声音，保存到手表并同步到配对 iPhone。",
     NSLocationWhenInUseUsageDescription="仅在你开启大致位置记录后，低频采样录音时所在的大致区域。")
 widget_info = dict(base_info, CFBundlePackageType="XPC!", NSExtension={"NSExtensionPointIdentifier": "com.apple.widgetkit-extension"})
+if CORE_TESTING:
+    phone_info.pop("NSHealthShareUsageDescription", None)
 write_plist(ROOT / "Phone/Info.plist", phone_info)
 write_plist(ROOT / "Watch/Info.plist", watch_info)
 write_plist(ROOT / "Widgets/PhoneInfo.plist", widget_info)
@@ -72,6 +81,7 @@ write_plist(ROOT / "Widgets/DayTape.entitlements", group_entitlements)
 write_plist(ROOT / "Phone/NoHealth.entitlements", group_entitlements)
 write_plist(ROOT / "Phone/DayTape.entitlements", dict(group_entitlements,
     **{"com.apple.developer.healthkit": True, "com.apple.developer.healthkit.background-delivery": True}))
+write_plist(ROOT / "Shared/CoreTesting.entitlements", {})
 
 files, groups = {}, {}
 kinds = {".swift": "sourcecode.swift", ".c": "sourcecode.c.c", ".h": "sourcecode.c.h",
@@ -97,6 +107,11 @@ target_specs = [
     ("DayTapeWatch", "watchos", ".watchkitapp", "Watch/Info.plist", "Watch/DayTape.entitlements", False),
     ("DayTape", "iphoneos", "", "Phone/Info.plist", "$(DAYTAPE_ENTITLEMENTS)", False),
 ]
+if CORE_TESTING:
+    target_specs = [
+        ("DayTapeWatch", "watchos", ".watchkitapp", "Watch/Info.plist", "Shared/CoreTesting.entitlements", False),
+        ("DayTape", "iphoneos", "", "Phone/Info.plist", "Shared/CoreTesting.entitlements", False),
+    ]
 products = {}
 for name, _, _, _, _, extension in target_specs:
     products[name] = add("product:" + name, "PBXFileReference", explicitFileType="wrapper.app-extension" if extension else "wrapper.application",
@@ -162,6 +177,8 @@ for name, sdk, suffix, info, entitlements, extension in target_specs:
                       for path in sorted(files) if path.startswith("Licenses/") and path.endswith(".txt")]
     phases.append(add(name + ":resources", "PBXResourcesBuildPhase", buildActionMask=2147483647, files=resources, runOnlyForDeploymentPostprocessing=0))
     children = [] if extension else (["DayTapeWatchWidgets"] if sdk == "watchos" else ["DayTapeWidgets", "DayTapeWatch"])
+    if CORE_TESTING:
+        children = [] if sdk == "watchos" else ["DayTapeWatch"]
     phases += [embed(name, child, watch=child == "DayTapeWatch") for child in children]
     settings = dict(SDKROOT=sdk, CODE_SIGN_STYLE="Automatic", PRODUCT_NAME="$(TARGET_NAME)",
         PRODUCT_BUNDLE_IDENTIFIER="$(DAYTAPE_BUNDLE_PREFIX)" + suffix, INFOPLIST_FILE=info,
@@ -182,7 +199,7 @@ for name, sdk, suffix, info, entitlements, extension in target_specs:
     else:
         settings.update(ASSETCATALOG_COMPILER_APPICON_NAME="AppIcon", SWIFT_OBJC_BRIDGING_HEADER="$(SRCROOT)/Shared/RecorderRules.h")
     if name == "DayTape":
-        settings["SWIFT_ACTIVE_COMPILATION_CONDITIONS"] = "$(DAYTAPE_HEALTHKIT_FLAG)"
+        settings["SWIFT_ACTIVE_COMPILATION_CONDITIONS"] = "" if CORE_TESTING else "$(DAYTAPE_HEALTHKIT_FLAG)"
     target = add("target:" + name, "PBXNativeTarget", buildConfigurationList=configuration_list(name, settings), buildPhases=phases,
                  buildRules=[], dependencies=[dependency(name, child) for child in children], name=name, productName=name,
                  packageProductDependencies=phone_products if name == "DayTape" else [], productReference=products[name],
@@ -191,8 +208,8 @@ for name, sdk, suffix, info, entitlements, extension in target_specs:
 
 attributes = {}
 for name, *_ in target_specs:
-    capabilities = {"com.apple.ApplicationGroups.iOS": {"enabled": 1}}
-    if name == "DayTape":
+    capabilities = {} if CORE_TESTING else {"com.apple.ApplicationGroups.iOS": {"enabled": 1}}
+    if name == "DayTape" and not CORE_TESTING:
         capabilities["com.apple.HealthKit"] = {"enabled": 1}
     attributes[key("target:" + name)] = dict(CreatedOnToolsVersion="16.0", ProvisioningStyle="Automatic", SystemCapabilities=capabilities)
 add("project", "PBXProject", attributes=dict(BuildIndependentTargetsInParallel="YES", LastUpgradeCheck="1600", TargetAttributes=attributes),
@@ -225,4 +242,4 @@ for name in ["DayTape", "DayTapeWatch"]:
     output.parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(scheme).write(output, encoding="UTF-8", xml_declaration=True)
 
-print("Generated four targets, companion/widget embedding, permissions, entitlements and app schemes.")
+print("Generated " + FEATURE_SET + ": " + str(len(target_specs)) + " targets with explicit capability and embedding settings.")

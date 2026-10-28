@@ -123,6 +123,12 @@ struct DayTapeRootView: View {
     }
     private var settings: some View {
         Form {
+            if AppBuildFeatures.coreTesting {
+                Section {
+                    Text("核心测试版：可测试录音、同步、转写和 AI；本版本暂不包含健康关联及小组件。")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                }
+            }
             Section("录音与处理") {
                 NavigationLink("备份与存储") { ArchiveSettingsView(archive: archive, connection: archive.connection) }
                 NavigationLink("转写与 AI") { IntelligenceSettingsView(controller: intelligence) }
@@ -130,8 +136,10 @@ struct DayTapeRootView: View {
                 NavigationLink("个人记忆") { MemoriesView(controller: intelligence) }
             }
             Section("可选关联") {
-                Toggle("关联 Apple 健康样本", isOn: Binding(get: { context.settings.healthEnabled }, set: { value in Task { await context.setHealthEnabled(value) } }))
-                    .disabled(!context.healthAvailable)
+                if !AppBuildFeatures.coreTesting {
+                    Toggle("关联 Apple 健康样本", isOn: Binding(get: { context.settings.healthEnabled }, set: { value in Task { await context.setHealthEnabled(value) } }))
+                        .disabled(!context.healthAvailable)
+                }
                 Toggle("记录大致地点", isOn: Binding(get: { context.settings.locationEnabled }, set: { context.setLocationEnabled($0) }))
                 if let error = context.errorText { Text(error).font(.caption).foregroundStyle(.orange) }
                 Text(context.status).font(.caption).foregroundStyle(.secondary)
@@ -139,7 +147,9 @@ struct DayTapeRootView: View {
             Section("访问与导出") {
                 NavigationLink("电脑只读接入") { DesktopBridgeView(bridge: desktop) }
                 Button("批量导出录音、文字和回顾") { showExport = true }.disabled(clips.isEmpty)
-                Toggle("小组件显示回顾标题", isOn: $widgetTitles).onChange(of: widgetTitles) { _, _ in updateWidget(force: true) }
+                if AppBuildFeatures.widgetsAvailable {
+                    Toggle("小组件显示回顾标题", isOn: $widgetTitles).onChange(of: widgetTitles) { _, _ in updateWidget(force: true) }
+                }
                 NavigationLink("组件与模型来源") { ThirdPartyNoticesView() }
             }
         }.navigationTitle("设置")
@@ -152,6 +162,7 @@ struct DayTapeRootView: View {
         catch { loadError = error.localizedDescription }
     }
     private func updateWidget(force: Bool = false) {
+        guard AppBuildFeatures.widgetsAvailable else { return }
         guard force || Date().timeIntervalSince(lastWidgetUpdate) >= 5 * 60 else { return }
         lastWidgetUpdate = Date()
         let calendar = DailySchedule().calendar
@@ -239,7 +250,7 @@ struct RecordingDetailView: View {
                let url = URL(string: "https://maps.apple.com/?ll=\(coordinate.latitude),\(coordinate.longitude)") {
                 Section("大致地点") { Link("在地图查看 · 精度约 \(Int(coordinate.horizontalAccuracy)) 米", destination: url) }
             }
-            if context.settings.healthEnabled {
+            if context.settings.healthEnabled && !AppBuildFeatures.coreTesting {
                 Section("同时间健康样本") {
                     if let snapshot = context.healthSnapshot(for: clip) {
                         if let value = snapshot.averageHeartRate { LabeledContent("平均心率", value: String(format: "%.0f 次/分钟", value)) }

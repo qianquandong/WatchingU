@@ -24,6 +24,8 @@
 	<false/>
 	<key>DayTapeAppGroup</key>
 	<string>$(DAYTAPE_APP_GROUP)</string>
+	<key>DayTapeFeatureSet</key>
+	<string>full</string>
 	<key>WKApplication</key>
 	<true/>
 	<key>WKCompanionAppBundleIdentifier</key>

@@ -12,7 +12,8 @@ struct DayTapeWidgetSnapshot: Codable, Equatable {
 
 enum WidgetSnapshotStore {
     static var appGroup: String {
-        Bundle.main.object(forInfoDictionaryKey: "DayTapeAppGroup") as? String ?? ""
+        guard Bundle.main.object(forInfoDictionaryKey: "DayTapeFeatureSet") as? String != "core-testing" else { return "" }
+        return Bundle.main.object(forInfoDictionaryKey: "DayTapeAppGroup") as? String ?? ""
     }
     static func save(_ snapshot: DayTapeWidgetSnapshot) {
         guard !appGroup.isEmpty, let defaults = UserDefaults(suiteName: appGroup),

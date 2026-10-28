@@ -11,7 +11,16 @@ fail() { printf '%s\n' "TestFlight: $*" >&2; exit 1; }
 [[ -n "${RUNNER_TEMP:-}" ]] || fail 'RUNNER_TEMP is required.'
 export APPLE_SIGNING_STYLE="${APPLE_SIGNING_STYLE:-automatic}"
 export TF_BUILD_MODE="${TF_BUILD_MODE:-google-drive}"
-export DAYTAPE_APP_GROUP="${DAYTAPE_APP_GROUP:-group.${DAYTAPE_BUNDLE_PREFIX:-}}"
+export TF_FEATURE_SET="${TF_FEATURE_SET:-full}"
+case "$TF_FEATURE_SET" in
+  full) export DAYTAPE_APP_GROUP="${DAYTAPE_APP_GROUP:-group.${DAYTAPE_BUNDLE_PREFIX:-}}" ;;
+  core-testing)
+    [[ "$APPLE_SIGNING_STYLE" == automatic ]] || fail 'The explicit core-testing fallback supports automatic signing only.'
+    export DAYTAPE_APP_GROUP=
+    printf '%s\n' 'CORE TESTING VARIANT: health association and widgets are omitted. Recording, synchronization, transcription and AI remain available.'
+    ;;
+  *) fail 'TF_FEATURE_SET must be full or core-testing.' ;;
+esac
 case "$TF_BUILD_MODE" in
   google-drive) printf '%s\n' 'Build mode: Google Drive backup. A real Google iOS OAuth client is required.' ;;
   local-recording)
@@ -48,9 +57,12 @@ if missing:
 patterns = {
     'APPLE_TEAM_ID': r'[A-Z0-9]{10}',
     'DAYTAPE_BUNDLE_PREFIX': r'[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+){2,}',
-    'DAYTAPE_APP_GROUP': r'group\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+){1,}',
     'APP_STORE_CONNECT_API_KEY_ID': r'[A-Z0-9]{10}',
 }
+if os.environ['TF_FEATURE_SET'] == 'full':
+    patterns['DAYTAPE_APP_GROUP'] = r'group\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+){1,}'
+elif os.environ['DAYTAPE_APP_GROUP']:
+    raise SystemExit('The core-testing variant must have no configured App Group.')
 if os.environ['TF_BUILD_MODE'] == 'google-drive':
     patterns['GOOGLE_CLIENT_ID'] = r'[0-9]+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com'
 for name, pattern in patterns.items():
@@ -72,6 +84,9 @@ for name in required:
             raise SystemExit('The App Store Connect API secret must contain the downloaded .p8 private key.')
 print('Required configuration is present for build mode ' + os.environ['TF_BUILD_MODE'] + '.')
 PY
+
+# Generate an explicit variant in this disposable checkout; default/full retains four targets.
+python3 Scripts/generate_project.py --feature-set "$TF_FEATURE_SET"
 
 # Reject missing or transparent store icons before the full build and upload.
 # Asset catalogs compile the same opaque 1024px source for both app platforms.
@@ -286,8 +301,8 @@ lines = [
     'DEVELOPMENT_TEAM = ' + os.environ['APPLE_TEAM_ID'],
     'GOOGLE_CLIENT_ID = ' + client,
     'GOOGLE_REVERSED_CLIENT_ID = ' + '.'.join(reversed(client.split('.'))),
-    'DAYTAPE_HEALTHKIT_FLAG = DAYTAPE_HEALTHKIT',
-    'DAYTAPE_ENTITLEMENTS = Phone/DayTape.entitlements',
+    'DAYTAPE_HEALTHKIT_FLAG = ' + ('DAYTAPE_HEALTHKIT' if os.environ['TF_FEATURE_SET'] == 'full' else ''),
+    'DAYTAPE_ENTITLEMENTS = ' + ('Phone/DayTape.entitlements' if os.environ['TF_FEATURE_SET'] == 'full' else 'Shared/CoreTesting.entitlements'),
     'CODE_SIGN_STYLE = ' + style.capitalize(),
 ]
 options = dict(method='app-store-connect', signingStyle=style,
@@ -361,7 +376,7 @@ run_private archive xcodebuild \
   CODE_SIGN_STYLE="$(python3 -c 'import os; print(os.environ["APPLE_SIGNING_STYLE"].capitalize())')" \
   archive
 
-if [[ "$APPLE_SIGNING_STYLE" == automatic ]]; then
+if [[ "$APPLE_SIGNING_STYLE" == automatic && "$TF_FEATURE_SET" == full ]]; then
   # Export inherits capability claims from archive signatures. Seed private ad-hoc
   # signatures first; the export step must still produce real distribution signing.
   run_private preserve-entitlements python3 Scripts/preserve_archive_entitlements.py \
@@ -374,6 +389,9 @@ run_private export xcodebuild -exportArchive \
   ${export_options[@]+"${export_options[@]}"}
 
 # Verify package metadata, then the actual distribution signatures/profiles.
+if [[ "$TF_FEATURE_SET" == core-testing ]]; then
+  run_private verify-core-export python3 Scripts/verify_core_export.py
+else
 python3 - <<'PY'
 import datetime
 import os
@@ -503,6 +521,7 @@ for label, app, identifier in [('iPhone', apps[0], bundle),
 print('Verified all four App Store distribution signatures, teams, groups, application identifiers and embedded profiles for '
       + os.environ['TF_BUILD_MODE'] + '.')
 PY
+fi
 
 # Xcode's upload destination uses API-key authentication and the same archive.
 # It uploads a build only: no App Store release, tester invitation or beta review.
@@ -515,6 +534,9 @@ printf '%s\n' 'Upload accepted by App Store Connect. Apple processing must finis
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   printf 'Uploaded DayTape build **%s** (%s) to App Store Connect. Apple processing is still required; check TestFlight for the final status.\n' \
     "$TF_BUILD_NUMBER" "$TF_BUILD_MODE" >> "$GITHUB_STEP_SUMMARY"
+  if [[ "$TF_FEATURE_SET" == core-testing ]]; then
+    printf '\n**Core testing variant:** health association and widgets are omitted. Recording, synchronization, transcription, AI, marks, location, speaker identification, export and desktop access remain available. This is not a full-capability acceptance build.\n' >> "$GITHUB_STEP_SUMMARY"
+  fi
   if [[ "$TF_BUILD_MODE" == local-recording ]]; then
     printf '\nLocal recording only: Google Drive upload and cloud-based local cleanup are unavailable. Recordings remain on the iPhone.\n' \
       >> "$GITHUB_STEP_SUMMARY"

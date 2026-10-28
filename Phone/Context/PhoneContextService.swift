@@ -1,6 +1,8 @@
 import Foundation
 import Combine
+#if DAYTAPE_HEALTHKIT
 import HealthKit
+#endif
 import UIKit
 
 /// All context is optional. Reading a recording's health window runs on iPhone, never on Watch.
@@ -14,7 +16,9 @@ final class PhoneContextService: ObservableObject {
     private let context: RecordingContextStore
     private let audioStore: ClipStore
     private let connectivity: Connectivity
+    #if DAYTAPE_HEALTHKIT
     private let health = HKHealthStore()
+    #endif
     private var refreshID = UUID()
     private var settingsObserver: NSObjectProtocol?
     private var contextObserver: NSObjectProtocol?
@@ -29,6 +33,7 @@ final class PhoneContextService: ObservableObject {
         context = try RecordingContextStore(root: store.root)
         settings = try context.settings()
         if settings.healthEnabled || settings.locationEnabled { status = "按已开启的选项关联可用情境数据" }
+        if AppBuildFeatures.coreTesting { status = "核心测试版保留地点与标记；健康关联暂不提供" }
         settingsObserver = NotificationCenter.default.addObserver(forName: .recordingContextSettingsChanged,
             object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
@@ -57,7 +62,13 @@ final class PhoneContextService: ObservableObject {
         if let observer = archiveObserver { NotificationCenter.default.removeObserver(observer) }
         if let observer = foregroundObserver { NotificationCenter.default.removeObserver(observer) }
     }
-    var healthAvailable: Bool { HKHealthStore.isHealthDataAvailable() }
+    var healthAvailable: Bool {
+        #if DAYTAPE_HEALTHKIT
+        return !AppBuildFeatures.coreTesting && HKHealthStore.isHealthDataAvailable()
+        #else
+        return false
+        #endif
+    }
     func setLocationEnabled(_ enabled: Bool) {
         do {
             var next = try context.settings(); next.locationEnabled = enabled
@@ -67,6 +78,7 @@ final class PhoneContextService: ObservableObject {
         } catch { errorText = "位置设置未保存，请重试。" }
     }
     func setHealthEnabled(_ enabled: Bool) async {
+        #if DAYTAPE_HEALTHKIT
         let settingID = UUID(); healthSettingID = settingID
         if enabled {
             guard healthAvailable else { errorText = "此设备无法读取 Apple 健康数据。"; return }
@@ -87,6 +99,10 @@ final class PhoneContextService: ObservableObject {
                 status = "健康关联已关闭"
             } catch { errorText = "健康设置未保存，请重试。" }
         }
+        #else
+        currentSnapshot = nil; refreshing = false
+        errorText = "此核心测试版本暂不包含 Apple 健康关联。"
+        #endif
     }
     private func saveHealthSetting(_ enabled: Bool) throws {
         var next = try context.settings(); next.healthEnabled = enabled
@@ -102,7 +118,7 @@ final class PhoneContextService: ObservableObject {
     }
     func location(for clip: Clip) -> RecordingContextPacket? { try? context.location(for: clip) }
     func healthSnapshot(for clip: Clip) -> HealthContextSnapshot? {
-        guard settings.healthEnabled else { return nil }
+        guard !AppBuildFeatures.coreTesting, settings.healthEnabled else { return nil }
         return try? context.health(for: clip.id)
     }
     func deleteContext(for clip: Clip) throws {
@@ -147,6 +163,7 @@ final class PhoneContextService: ObservableObject {
             if currentSnapshot?.clipID == clip.id { currentSnapshot = nil }
             return
         }
+        #if DAYTAPE_HEALTHKIT
         guard settings.healthEnabled, healthAvailable else { currentSnapshot = nil; return }
         let id = UUID(); refreshID = id; refreshing = true
         defer { if refreshID == id { refreshing = false } }
@@ -170,7 +187,11 @@ final class PhoneContextService: ObservableObject {
             NotificationCenter.default.post(name: .recordingContextChanged, object: nil)
         } catch is CancellationError { }
         catch { if refreshID == id { errorText = "暂时无法读取健康样本；未授权或没有样本时不会补造数据。" } }
+        #else
+        currentSnapshot = nil; refreshing = false
+        #endif
     }
+    #if DAYTAPE_HEALTHKIT
     private func quantity(_ identifier: HKQuantityTypeIdentifier, unit: HKUnit, options: HKStatisticsOptions,
                           from start: Date, to end: Date) async throws -> Double? {
         guard let type = HKQuantityType.quantityType(forIdentifier: identifier) else { return nil }
@@ -204,4 +225,5 @@ final class PhoneContextService: ObservableObject {
             health.execute(query)
         }
     }
+    #endif
 }

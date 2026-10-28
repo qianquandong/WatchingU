@@ -92,6 +92,8 @@ Use the same `base64 -i /path/to/file | pbcopy` command for each file. Keep sign
 
 ## Upload and install
 
+The default `feature_set` is `full`: four targets, HealthKit and the shared App Group remain mandatory and independently verified. An explicit `core-testing` fallback is available only for automatic signing when Apple capability registration is externally blocked. It contains the iPhone and Watch apps with empty capability entitlements, no Widget extensions, no HealthKit API calls and no widget sharing. The app and workflow summary label these omissions. Core recording, paired synchronization, transcription, AI, marks, location, speaker identification, export and desktop access remain in the source. This switch is independent from the Google Drive `build_mode`; it must never be used to call a limited build fully accepted. `verify_core_export.py` still requires real App Store signatures, matching identifiers/versions and distribution profiles, and rejects a core executable claiming Group or HealthKit. Selecting `full` restores the four-target generation and its existing strict checks.
+
 1. Open **Actions → TestFlight → Run workflow**, select `main`, choose `google-drive` (default) or `local-recording`, and run it. Only a manual run on `main` can reach signing and upload.
 2. The workflow assigns a matching app/Widget build number from `run_number.run_attempt`. If an existing App Store Connect build has a higher number, increase the project's marketing version or adjust the numbering before another upload.
 3. After upload, open the app's **App Store Connect → TestFlight** page and wait for Apple's processing. A green workflow reports upload acceptance; it does not prove Apple processing succeeded.

@@ -11,6 +11,14 @@ on:
         options:
           - google-drive
           - local-recording
+      feature_set:
+        description: Full capabilities, or explicit core testing fallback without health and widgets
+        type: choice
+        required: true
+        default: full
+        options:
+          - full
+          - core-testing
 
 permissions:
   contents: read
@@ -25,6 +33,7 @@ jobs:
     timeout-minutes: 45
     env:
       TF_BUILD_MODE: ${{ inputs.build_mode || 'google-drive' }}
+      TF_FEATURE_SET: ${{ inputs.feature_set || 'full' }}
       APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
       DAYTAPE_BUNDLE_PREFIX: ${{ vars.DAYTAPE_BUNDLE_PREFIX }}
       DAYTAPE_APP_GROUP: ${{ vars.DAYTAPE_APP_GROUP }}
