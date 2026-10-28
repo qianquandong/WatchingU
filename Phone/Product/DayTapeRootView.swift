@@ -73,6 +73,17 @@ struct DayTapeRootView: View {
                 }
                 Text(archive.status).font(.caption).foregroundStyle(.secondary)
             } header: { Text("处理进度") }
+            if intelligence.pendingDeletionCount > 0 {
+                Section("删除清理") {
+                    Text("有 \(intelligence.pendingDeletionCount) 条本机记录的删除清理尚未完成，相关内容已从检索中隐藏。")
+                        .font(.subheadline)
+                    if let message = intelligence.deletionCleanupError { Text(message).font(.caption).foregroundStyle(.orange) }
+                    Button("重试清理本机数据") {
+                        intelligence.retryPendingDeletions()
+                        context.retryDeletedContextCleanup()
+                    }
+                }
+            }
             if let error = loadError ?? transport.errorText ?? playback.errorText ?? intelligence.lastError {
                 Section { Text(error).foregroundStyle(.orange).textSelection(.enabled) }
             }

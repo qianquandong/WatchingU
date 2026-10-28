@@ -75,14 +75,18 @@ final class IntelligenceDisk {
             let clips = try decoder.decode([UUID].self, from: Data(contentsOf: file))
             if clips.contains(clipID) {
                 let prefix = String(file.lastPathComponent.dropLast(".manifest.json".count))
-                for item in files where item.lastPathComponent.hasPrefix(prefix + "-") || item == file {
-                    try FileManager.default.removeItem(at: item)
+                for item in files where item.lastPathComponent.hasPrefix(prefix + "-") {
+                    if FileManager.default.fileExists(atPath: item.path) { try FileManager.default.removeItem(at: item) }
                 }
+                // Keep the manifest until every derived part is gone, so crashes and errors
+                // leave enough information for an idempotent retry.
+                if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
                 removed.insert(prefix)
             }
         }
         if let progress = try progress(), removed.contains(progress.fingerprint) {
-            try FileManager.default.removeItem(at: aiPartsURL.appendingPathComponent("progress.json"))
+            let url = aiPartsURL.appendingPathComponent("progress.json")
+            if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
         }
     }
     private func write(_ data: Data, to url: URL) throws {

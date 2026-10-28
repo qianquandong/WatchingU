@@ -122,11 +122,12 @@ final class RecordingContextStore {
     private struct SendState: Codable { let attempts: Int; let retryAfter: Date }
     private struct DeletedInterval: Codable {
         let clipID: UUID
-        let sessionID: UUID
-        let start: Date
-        let end: Date
+        let sessionID: UUID?
+        let start: Date?
+        let end: Date?
         func contains(_ packet: RecordingContextPacket) -> Bool {
             if let mapped = packet.clipID { return mapped == clipID }
+            guard let sessionID = sessionID, let start = start, let end = end else { return false }
             return packet.sessionID == sessionID && packet.recordedAt >= start && packet.recordedAt < end
         }
     }
@@ -154,7 +155,9 @@ final class RecordingContextStore {
             .map { try decoder.decode(DeletedInterval.self, from: Data(contentsOf: $0)) }
     }
     private func isDeleted(_ clipID: UUID) -> Bool {
-        FileManager.default.fileExists(atPath: url(clipID, suffix: ".contextdeleted.json").path)
+        FileManager.default.fileExists(atPath: url(clipID, suffix: ".contextdeleted.json").path) ||
+            FileManager.default.fileExists(atPath: root.deletingLastPathComponent()
+                .appendingPathComponent(clipID.uuidString + ".deleted.json").path)
     }
     func settings() throws -> RecordingContextSettings {
         try locked {
@@ -232,8 +235,13 @@ final class RecordingContextStore {
             let value = try decoder.decode(RecordingContextPacket.self, from: data)
             guard value.id == id, value.isValid, value.recordedAt <= Date().addingTimeInterval(60) else { throw ArchiveError.invalidMetadata }
             // User-deleted marks must not reappear when an old Watch transfer is retried.
-            if value.kind == .mark, try deletedIntervals().contains(where: { $0.contains(value) }) {
-                return ContextReceipt(packetID: id, byteCount: pair.0, sha256: pair.1)
+            if value.kind == .mark {
+                if value.clipID.map({ isDeleted($0) }) == true {
+                    return ContextReceipt(packetID: id, byteCount: pair.0, sha256: pair.1)
+                }
+                if try deletedIntervals().contains(where: { $0.contains(value) }) {
+                    return ContextReceipt(packetID: id, byteCount: pair.0, sha256: pair.1)
+                }
             }
             let destination = url(id, suffix: ".context.json")
             if FileManager.default.fileExists(atPath: destination.path) {
@@ -285,9 +293,12 @@ final class RecordingContextStore {
     }
     func marks() throws -> [RecordingMark] {
         try locked {
-            try packets().filter { $0.kind == .mark }.map { packet in
+            try packets().filter { $0.kind == .mark }.compactMap { packet -> RecordingMark? in
+                if packet.clipID.map({ isDeleted($0) }) == true { return nil }
                 if let data = try? Data(contentsOf: url(packet.id, suffix: ".markposition.json")),
-                   let value = try? decoder.decode(RecordingMark.self, from: data), value.id == packet.id { return value }
+                   let value = try? decoder.decode(RecordingMark.self, from: data), value.id == packet.id {
+                    return value.clipID.map({ isDeleted($0) }) == true ? nil : value
+                }
                 return RecordingMark(id: packet.id, sessionID: packet.sessionID, recordedAt: packet.recordedAt,
                                      label: packet.label!, clipID: nil, clipOffset: nil)
             }
@@ -324,14 +335,40 @@ final class RecordingContextStore {
                 end: clip.startedAt.addingTimeInterval(clip.duration))
             // Write the small, non-content tombstone before removing context files.
             try write(encoder.encode(interval), to: url(clip.id, suffix: ".contextdeleted.json"))
+            try deleteContext(for: clip.id)
+        }
+    }
+    /// Recovery uses the authoritative audio tombstone even after the library row is gone.
+    /// An ID alone never guesses the time range of an old, unresolved mark.
+    func deleteContext(for clipID: UUID) throws {
+        try locked {
+            let tombstone = url(clipID, suffix: ".contextdeleted.json")
+            let interval: DeletedInterval
+            if FileManager.default.fileExists(atPath: tombstone.path) {
+                interval = try decoder.decode(DeletedInterval.self, from: Data(contentsOf: tombstone))
+                guard interval.clipID == clipID else { throw ArchiveError.invalidMetadata }
+            } else {
+                interval = DeletedInterval(clipID: clipID, sessionID: nil, start: nil, end: nil)
+                try write(encoder.encode(interval), to: tombstone)
+            }
+            // Clear health first, even if an unrelated malformed packet needs a later retry.
+            let health = url(clipID, suffix: ".health.json")
+            if FileManager.default.fileExists(atPath: health.path) { try FileManager.default.removeItem(at: health) }
+            var markIDs = Set<UUID>()
+            for path in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+                where path.lastPathComponent.hasSuffix(".markposition.json") {
+                let value = try decoder.decode(RecordingMark.self, from: Data(contentsOf: path))
+                if value.clipID == clipID { markIDs.insert(value.id) }
+            }
             for packet in try packets() where packet.kind == .mark && interval.contains(packet) {
+                markIDs.insert(packet.id)
+            }
+            for id in markIDs {
                 for suffix in [".context.json", ".markposition.json", ".contextack.json", ".contextretry.json"] {
-                    let path = url(packet.id, suffix: suffix)
+                    let path = url(id, suffix: suffix)
                     if FileManager.default.fileExists(atPath: path.path) { try FileManager.default.removeItem(at: path) }
                 }
             }
-            let health = url(clip.id, suffix: ".health.json")
-            if FileManager.default.fileExists(atPath: health.path) { try FileManager.default.removeItem(at: health) }
             // Location samples are shared by neighbouring clips. The tombstone removes this
             // clip's association without erasing a location still used by another recording.
         }

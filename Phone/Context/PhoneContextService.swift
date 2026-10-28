@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import HealthKit
+import UIKit
 
 /// All context is optional. Reading a recording's health window runs on iPhone, never on Watch.
 @MainActor
@@ -17,7 +18,11 @@ final class PhoneContextService: ObservableObject {
     private var refreshID = UUID()
     private var settingsObserver: NSObjectProtocol?
     private var contextObserver: NSObjectProtocol?
+    private var archiveObserver: NSObjectProtocol?
+    private var foregroundObserver: NSObjectProtocol?
     private var healthSettingID = UUID()
+    private var completedDeletionIDs = Set<UUID>()
+    private let deletionError = "已删除录音的情境数据尚未清理完毕，请重试。"
 
     init(store: ClipStore, connectivity: Connectivity) throws {
         audioStore = store; self.connectivity = connectivity
@@ -36,10 +41,21 @@ final class PhoneContextService: ObservableObject {
             object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.objectWillChange.send() }
         }
+        archiveObserver = NotificationCenter.default.addObserver(forName: .archiveChanged,
+            object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.retryDeletedContextCleanup() }
+        }
+        foregroundObserver = NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification,
+            object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.retryDeletedContextCleanup() }
+        }
+        retryDeletedContextCleanup()
     }
     deinit {
         if let observer = settingsObserver { NotificationCenter.default.removeObserver(observer) }
         if let observer = contextObserver { NotificationCenter.default.removeObserver(observer) }
+        if let observer = archiveObserver { NotificationCenter.default.removeObserver(observer) }
+        if let observer = foregroundObserver { NotificationCenter.default.removeObserver(observer) }
     }
     var healthAvailable: Bool { HKHealthStore.isHealthDataAvailable() }
     func setLocationEnabled(_ enabled: Bool) {
@@ -90,12 +106,47 @@ final class PhoneContextService: ObservableObject {
         return try? context.health(for: clip.id)
     }
     func deleteContext(for clip: Clip) throws {
-        try context.deleteContext(for: clip)
+        do {
+            try context.deleteContext(for: clip)
+            completedDeletionIDs.insert(clip.id)
+        } catch {
+            errorText = deletionError
+            throw error
+        }
         refreshID = UUID(); refreshing = false
         if currentSnapshot?.clipID == clip.id { currentSnapshot = nil }
         NotificationCenter.default.post(name: .recordingContextChanged, object: nil)
     }
+    /// Failed removals remain eligible on the next launch, foreground, refresh, or manual retry.
+    func retryDeletedContextCleanup() {
+        _ = reconcileDeletedContext()
+    }
+    @discardableResult
+    private func reconcileDeletedContext() -> Set<UUID>? {
+        do {
+            let deleted = try audioStore.deletedClipIDs()
+            if let value = currentSnapshot, deleted.contains(value.clipID) {
+                currentSnapshot = nil; refreshID = UUID(); refreshing = false
+            }
+            var failed = false
+            for id in deleted.subtracting(completedDeletionIDs) {
+                do { try context.deleteContext(for: id); completedDeletionIDs.insert(id) }
+                catch { failed = true }
+            }
+            if failed { errorText = deletionError }
+            else if errorText == deletionError { errorText = nil }
+            objectWillChange.send()
+            return deleted
+        } catch {
+            errorText = deletionError
+            return nil
+        }
+    }
     func refresh(for clip: Clip) async {
+        guard let deleted = reconcileDeletedContext(), !deleted.contains(clip.id) else {
+            if currentSnapshot?.clipID == clip.id { currentSnapshot = nil }
+            return
+        }
         guard settings.healthEnabled, healthAvailable else { currentSnapshot = nil; return }
         let id = UUID(); refreshID = id; refreshing = true
         defer { if refreshID == id { refreshing = false } }
@@ -111,7 +162,10 @@ final class PhoneContextService: ObservableObject {
                 activeEnergyKilocalories: energy, sleepMinutes: sleeping)
             try Task.checkCancellation()
             guard settings.healthEnabled, refreshID == id else { return }
-            try context.saveHealth(value); currentSnapshot = value; errorText = nil
+            // A user may delete this clip while HealthKit queries are in flight.
+            guard !(try audioStore.deletedClipIDs()).contains(clip.id) else { currentSnapshot = nil; return }
+            try context.saveHealth(value); currentSnapshot = value
+            if errorText != deletionError { errorText = nil }
             status = "同时间范围的可用健康样本已关联"
             NotificationCenter.default.post(name: .recordingContextChanged, object: nil)
         } catch is CancellationError { }

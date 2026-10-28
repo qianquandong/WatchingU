@@ -1,6 +1,6 @@
 # DayTape 0.5 功能与验证边界
 
-记录日期：2026-10-28。本文根据本轮仓库实现编写，不是上架或真机验收证明。最近一次 CI 已编译通过 iPhone／Watch；该次 Swift 测试有 ZIP Unicode 读取断言失败，修补及后续增量待重新验证，详见 `VALIDATION.md`。不能把“代码已实现”写成“所有功能均已验证”。
+记录日期：2026-10-28。本文根据本轮仓库实现编写，不是上架或真机验收证明。最新分支的测试、两端构建、客户端及模拟器启动结果以 [PR #1 Checks](https://github.com/qianquandong/WatchingU/pull/1/checks) 和[分支 CI](https://github.com/qianquandong/WatchingU/actions?query=branch%3Afeat%2Fdaytape-memory-suite) 对应提交为准；历史记录见 `VALIDATION.md`。不能把“代码已实现”写成“所有功能均已验证”。
 
 ## 已进入代码的功能
 
@@ -12,7 +12,7 @@
 | 24 小时积压提醒 | 预安排本地通知，无需全天轮询；通知去重，已无积压时取消。未授权通知不会建立“已安排”标记。忘记充电会保留本地音频。 | `Phone/BackupReminder.swift` | 拒绝后再授权、投递与去重、备份最后一笔时断电、手机重启。 |
 | 云校验和本地保留 | 稳定远端 ID，音频及 JSON 分别校验 SHA-256 与字节数，日清单确认后才按保留策略清理；正在播放、上传、导出或处理的音频应受保护。 | `Phone/ArchiveJournal.swift`、`Phone/NightArchiveController.swift`、`Shared/ClipStore.swift` | 请求已到服务器但响应丢失、旧后台上传迁移、账号更换和异常断网。 |
 | 本机转写 | Apple 本机语音识别，每窗口不超过 55 秒；串行队列、持久检查点、暂停和重试；设备没有对应本机模型时提示，不自动改用云识别。 | `Phone/Intelligence/LocalSpeechTranscriber.swift`、`IntelligenceController.swift` | 不同语言和设备、系统权限、本机模型可用性、长录音吞吐和取消延迟。 |
-| 可选远程／自建转写 | 默认仍为本机，旧设置也不会启用原声分享。用户选择服务、保存独立转写密钥后，还要单独允许向该地址分享原始录音；该授权与只发送文字的远程 AI 开关独立。支持兼容 `audio/transcriptions` 的 JSON／verbose_json 响应，复用 50 秒检查点。 | `Phone/Intelligence/RemoteSpeechTranscriber.swift`、`IntelligenceController.swift`、`IntelligenceViews.swift` | 最新增量尚待 CI；真实服务兼容性、费用、时间戳、取消及原声授权撤回。 |
+| 可选远程／自建转写 | 默认仍为本机，旧设置也不会启用原声分享。用户选择服务、保存独立转写密钥后，还要单独允许向该地址分享原始录音；该授权与只发送文字的远程 AI 开关独立。支持兼容 `audio/transcriptions` 的 JSON／verbose_json 响应，复用 50 秒检查点。 | `Phone/Intelligence/RemoteSpeechTranscriber.swift`、`IntelligenceController.swift`、`IntelligenceViews.swift` | 以对应提交 CI 为准；真实服务兼容性、费用、时间戳、取消及原声授权撤回需另外验收。 |
 | 检索与回听 | 关键词检索；语言有本机 NLEmbedding 时提供语义检索，否则说明降级；结果保留原录音位置，可回听。 | `Phone/Intelligence/IntelligenceController.swift`、`IntelligenceViews.swift` | 中文／多语召回、检索耗时与定位准确度。 |
 | AI 总结、高光、回顾及历史问答 | 用户显式开启远程 AI 后，使用配置的 HTTPS 接口和模型；密钥存 Keychain；显示原片段引用、覆盖范围和处理错误。自动回顾另有充电要求。 | `Phone/Intelligence/CompatibleAIClient.swift`、`IntelligenceController.swift`、`IntelligenceViews.swift` | 实际服务的兼容性、长上下文流程、引用和行动项质量；不能以引用格式正确代替事实验证。 |
 | 个人记忆 | 可添加、修改、停用和删除；AI 建议记忆先保持未启用。 | `Shared/IntelligenceModels.swift`、`Phone/Intelligence/IntelligenceViews.swift` | 修改和删除后派生内容失效、范围导出对未知来源记录的处理。 |
@@ -48,7 +48,7 @@
 ## 检查与交付状态
 
 - 已有共享逻辑测试覆盖存储、确认、日归档、充电门槛、手动批次截止点、24 小时提醒时点、上下文、ZIP 路径和 CRC，以及加密互通等；测试存在不等于已经在本环境运行。
-- 本轮 Windows 静态审查运行了 `git diff --check`。提交 `d996bad` 的 [CI 40642265497](https://github.com/qianquandong/WatchingU/actions/runs/40642265497) 中，iPhone／Watch 构建通过；73 项 Swift 测试的失败集中于 ZIP Unicode 读取的 2 个断言，已改用 Python zipfile 独立读取，尚待重跑。该结果不覆盖后续远程转写等本地增量。
+- 本轮 Windows 静态审查运行了 `git diff --check`。历史提交 `d996bad` 的 [CI 40642265497](https://github.com/qianquandong/WatchingU/actions/runs/40642265497) 中，iPhone／Watch 构建通过；73 项 Swift 测试的失败集中于 ZIP Unicode 读取的 2 个断言，随后改用 Python zipfile 独立读取。它是历史快照，后续修补的结果应在 [PR #1 Checks](https://github.com/qianquandong/WatchingU/pull/1/checks) 或[分支 CI](https://github.com/qianquandong/WatchingU/actions?query=branch%3Afeat%2Fdaytape-memory-suite) 核对。
 - 根任务报告 Python 客户端的 3 个测试已通过；这不等于 iPhone 服务端或真实网络已通过。
 - `.github/workflows/ci.yml` 调用原生构建、共享测试和客户端测试。CI 全绿之后仍需上述真机验收。
 - 本轮发现及修补状态见 `REVIEW_FINDINGS.md`。新功能代码、真实权限和系统调度均未满足“全部已验证”的表述条件。

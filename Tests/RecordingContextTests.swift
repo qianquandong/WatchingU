@@ -130,6 +130,63 @@ final class RecordingContextTests: XCTestCase {
         XCTAssertEqual(try reopened.marks().map(\.label), ["Keep"])
         XCTAssertEqual(try reopened.marks().first?.clipID, neighbour.id)
     }
+    func testAudioDeletionTombstoneHidesAndRecoversContextWithoutLibraryRow() throws {
+        let root = try directory(), context = try RecordingContextStore(root: root)
+        let session = UUID(), start = Date(timeIntervalSince1970: 1000)
+        let deleted = clip(session: session, start: start), neighbour = clip(session: session, start: start.addingTimeInterval(60))
+        let mapped = try context.addMark(sessionID: session, at: start, clipID: deleted.id, clipOffset: 0)
+        // Older packets acquire their clip identity in the separate position file.
+        let legacy = try context.addMark(sessionID: session, at: start.addingTimeInterval(10))
+        _ = try context.addMark(sessionID: session, at: start.addingTimeInterval(70), label: "Keep")
+        try context.resolveMarks(clips: [deleted, neighbour])
+        try context.addLocation(sessionID: session, at: start,
+            coordinate: RecordedCoordinate(latitude: 32.78, longitude: -96.8, horizontalAccuracy: 1000))
+        let health = HealthContextSnapshot(clipID: deleted.id, intervalStart: start, intervalEnd: start.addingTimeInterval(60),
+            capturedAt: start, averageHeartRate: 70, averageHRVSDNN: nil, stepCount: nil,
+            activeEnergyKilocalories: nil, sleepMinutes: nil)
+        try context.saveHealth(health)
+        try JSONEncoder().encode(Receipt(clip: deleted)).write(to: root.appendingPathComponent(deleted.id.uuidString + ".deleted.json"))
+        // Authority takes effect before a previously interrupted cleanup can retry.
+        XCTAssertNil(try context.health(for: deleted.id))
+        XCTAssertNil(try context.location(for: deleted))
+        XCTAssertEqual(try context.marks().map(\.label), ["Keep"])
+        let sender = try RecordingContextStore(root: directory())
+        let late = try sender.addMark(sessionID: session, at: start, clipID: deleted.id, clipOffset: 1)
+        let outgoing = try XCTUnwrap(sender.pending().first)
+        let receipt = try context.receive(outgoing.0, id: late.id, expectedBytes: outgoing.2, expectedHash: outgoing.3)
+        XCTAssertEqual(receipt.packetID, late.id)
+        XCTAssertFalse(try context.packets().contains { $0.id == late.id })
+        // No Clip or audio index is needed to finish physical removal after relaunch.
+        let reopened = try RecordingContextStore(root: root)
+        try reopened.deleteContext(for: deleted.id)
+        try reopened.deleteContext(for: deleted.id)
+        for id in [mapped.id, legacy.id] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: reopened.root.appendingPathComponent(id.uuidString + ".context.json").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: reopened.root.appendingPathComponent(id.uuidString + ".markposition.json").path))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: reopened.root.appendingPathComponent(deleted.id.uuidString + ".health.json").path))
+        try reopened.saveHealth(health)
+        XCTAssertNil(try reopened.health(for: deleted.id))
+        XCTAssertNotNil(try reopened.location(for: neighbour))
+        XCTAssertEqual(try reopened.marks().first?.clipID, neighbour.id)
+    }
+    func testContextDeletionCanRetryAfterTombstoneWriteFailure() throws {
+        let root = try directory(), context = try RecordingContextStore(root: root)
+        let session = UUID(), start = Date(timeIntervalSince1970: 1000)
+        let deleted = clip(session: session, start: start)
+        let mark = try context.addMark(sessionID: session, at: start, clipID: deleted.id, clipOffset: 0)
+        try JSONEncoder().encode(Receipt(clip: deleted)).write(to: root.appendingPathComponent(deleted.id.uuidString + ".deleted.json"))
+        let blockedPath = context.root.appendingPathComponent(deleted.id.uuidString + ".contextdeleted.json", isDirectory: true)
+        try FileManager.default.createDirectory(at: blockedPath, withIntermediateDirectories: true)
+        XCTAssertThrowsError(try context.deleteContext(for: deleted.id))
+        XCTAssertTrue(try context.packets().contains { $0.id == mark.id })
+        XCTAssertTrue(try context.marks().isEmpty)
+        try FileManager.default.removeItem(at: blockedPath)
+        let reopened = try RecordingContextStore(root: root)
+        try reopened.deleteContext(for: deleted.id)
+        XCTAssertTrue(try reopened.packets().isEmpty)
+        try reopened.deleteContext(for: deleted.id)
+    }
     func testApproximateLocationsValidateAndCannotCrossRecordingSessions() throws {
         let context = try RecordingContextStore(root: directory())
         let session = UUID(), start = Date(timeIntervalSince1970: 1000)

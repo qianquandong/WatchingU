@@ -21,6 +21,7 @@
 | R13 | P2 | 主界面初始 task 原先无条件报告前台有效；后台唤醒创建视图不代表系统已允许前台运行，可能令后台结束后仍留运行权。 | 初始状态已改为实际 `UIApplication.applicationState == .active`，之后跟随 scenePhase。已静态复核，待后台启动测试。 |
 | R14 | P2 | 更换最老积压片段时，未来才到期的旧提醒被当作已投递，导致下一段从 24 小时推迟到近 48 小时。 | 提醒时点规则已忽略未来的旧请求，仅对已到期的提醒节流；新增第 7 条充电规则测试。待 CI 和通知替换真机验证。 |
 | R15 | P1 | 原声远程转写如果沿用文字 AI 开关、旧配置或被变更的服务地址，会超出用户对录音接收方的授权。 | 新功能默认本机；独立原声分享开关及 Keychain 转写密钥；服务地址变更清除相应授权；窗口发送前后检查当前授权并限制重定向。旧配置／独立授权与响应时戳规则已有测试，最新增量待 CI 和真实服务验收。 |
+| R16 | P1 | 删除录音后，转写／回顾／记忆／上下文及派生缓存的持久清理若中途崩溃或磁盘操作失败，旧快照可能在下次启动重新显示已删除内容；先删缓存 manifest 还会失去重试所需的依赖索引。 | 修补要求以 Clip 删除墓碑为权威，启动导入和内存读取均过滤；逐项清理可重试且失败不恢复可见性；派生缓存和上下文采用同类处理，缓存 manifest 最后删除。最终实现及故障注入结果以对应提交和 CI 为准。 |
 
 上表记录发现与修补过程，不将“开发者已修改”写成“独立测试已通过”。并行编辑期间最终状态会继续变化；合并前以源码、CI 和对应回归结果更新。
 
@@ -28,15 +29,17 @@
 
 - FluidAudio v0.12.4 确实提供 `DiarizerModels.downloadIfNeeded(configuration:)`、`DiarizerManager.initialize(models:)`、`extractSpeakerEmbedding(from:)`、`initializeKnownSpeakers(_:)`、`performCompleteDiarization`；`Speaker` 初始化参数和 segment embedding 也与使用处相符。没有用文本向量或假数据冒充本人声纹。模型准确率和设备性能尚未验证。
 - `BridgeCrypto` 使用 CryptoKit AES-GCM，要求 32 字节密钥，拒绝过短帧；桌面服务随机生成每轮密钥、校验时间窗口并限制重放。Swift 和 Python 端的真实设备互通仍需验证。
-- `StoredZIP` 流式存储、不压缩 AAC；校验 ZIP32 大小、路径和重复名称，分别计算读入和复制后的 CRC／长度，避免源文件变化时交付成功。独立解压测试已编写，尚需本次 CI 运行结果。
+- `StoredZIP` 流式存储、不压缩 AAC；校验 ZIP32 大小、路径和重复名称，分别计算读入和复制后的 CRC／长度，避免源文件变化时交付成功。独立解压测试结果以对应提交 CI 为准。
 - 自动上传使用普通 ephemeral URLSession，只在前台或获准 BGProcessing 窗口内执行；请求逐次检查电源、网络、执行窗口和取消状态。`requiresExternalPower=true` 之外还有实际充电检查，不以 `isDiscretionary` 当作充电保证。
 - 旧 background URLSession 只用于取消和收尾旧任务；不创建新上传。取消后仍按稳定远端 ID 复核，避免把已到服务器但失去响应的上传重复保存。
 - 稳定 ID、两文件 SHA-256 校验、日清单和处理／播放 pin 参与本地清理保护；提醒不会因为忘记充电而删除音频。
 - 远程 ASR 与文字 AI 分开配置和授权。保存地址／密钥、开启文字 AI、设备缺本机模型，都不会自行许可发送原声；选择远程服务后仍需独立原声分享开关。修改接收地址撤销原有授权，关闭分享取消在途工作，实际已发出的数据不能收回。
 
-## 当前 CI 快照
+## CI 证据与历史快照
 
-提交 `d996bad` 的 [Native CI 40642265497](https://github.com/qianquandong/WatchingU/actions/runs/40642265497)：iPhone-build、Watch-build 均通过；73 项 Swift 测试在同一个 ZIP Unicode 文件名读取场景出现 2 个断言失败。测试原用系统 unzip CLI 按 Unicode 名称取内容，现已改为 Python 标准库 zipfile 独立解析和校验。此修补及其后的远程转写、授权、提醒和审查修补尚待完整重跑，不能宣称当前最新代码全部通过。
+最新结果见 [PR #1 Checks](https://github.com/qianquandong/WatchingU/pull/1/checks) 和[分支 CI](https://github.com/qianquandong/WatchingU/actions?query=branch%3Afeat%2Fdaytape-memory-suite)。应检查测试、构建、Python 客户端和模拟器启动各步骤，并确认运行对应的是最终代码提交；较早提交通过不能证明后续删除修补已验证。
+
+历史提交 `d996bad` 的 [Native CI 40642265497](https://github.com/qianquandong/WatchingU/actions/runs/40642265497)：iPhone-build、Watch-build 均通过；73 项 Swift 测试在同一个 ZIP Unicode 文件名读取场景出现 2 个断言失败。测试原用系统 unzip CLI 按 Unicode 名称取内容，随后改为 Python 标准库 zipfile 独立解析和校验。此记录保留当时结果，不作为当前分支的通过或失败状态。
 
 ## 必需回归与证据
 
@@ -46,6 +49,8 @@
 | macOS CI | 共享 Swift 测试、iPhone／Watch／Widget 编译、ZIP 独立解压、加密向量和 Python 客户端 | 可发现类型、链接、协议和规则回归；不能证明授权或系统调度。 |
 | iPhone 真机 | 充电／满电／未知／拔电、Wi-Fi 切换、BG 过期、授权前后、实际 Google Drive | 验证真实生命周期、提醒投递和云端幂等恢复。 |
 | 范围及删除 | 回顾输入有 A/B，引用只有 A；只选择 A；记忆来自 B／未知来源；删除 B | 验证完整输入依赖不会经回顾、记忆、导出或桌面接入泄露。 |
+| 删除持久恢复 | 写入 Clip 墓碑后，在智能快照、单独转写文件、AI 缓存、上下文清理各阶段注入崩溃／删除失败，再重启 | 墓碑始终阻止录音及文字、回顾、记忆、上下文重新可见；搜索、导出、桌面接口也不可读。失败可重试，不能因保留旧磁盘文件而恢复数据。 |
+| 派生缓存重试 | 删除部分块／上下文文件后失败；保留 manifest 重启重试；清理完成才移除索引 | 验证依赖索引最后删除，重复清理幂等，损坏或缺失的单个文件不会阻止其余清理；迟到 Watch 包不能复活内容。 |
 | 分享与取消 | 大文件 ZIP 中取消、原声分享同时云端清理、早期导出失败 | 验证音频 pin、暂存清理和工作停止。 |
 | 声纹 | 拒绝／同意麦克风、授权时离页、第三段处理中取消、多人识别、锁屏 | 验证无隐式启动、取消不保存新 profile，以及可解释的模型误差。 |
 | 远程转写授权 | 旧设置升级、只开启文字 AI、先保存再授权、更换服务地址、撤回分享、删除密钥、跨域重定向 | 验证默认仍为本机、未授权不发原声、新接收方需重新授权、在途任务停止及原声保留。 |

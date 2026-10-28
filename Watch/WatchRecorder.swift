@@ -81,10 +81,12 @@ final class WatchRecorder: ObservableObject {
     }
     func markImportantMoment() {
         guard phase == .recording else { return }
+        guard let position = writer?.positionSnapshot() else {
+            notice = "音频正在准备，请稍后再标记。"; return
+        }
         do {
             let context = try RecordingContextStore(root: store.root)
-            let position = writer?.positionSnapshot()
-            try context.addMark(sessionID: generation, at: Date(), clipID: position?.clipID, clipOffset: position?.clipOffset)
+            try context.addMark(sessionID: generation, at: Date(), clipID: position.clipID, clipOffset: position.clipOffset)
             markedCount += 1
             WKInterfaceDevice.current().play(.click)
         } catch { notice = "标记未保存，请重试；录音仍在继续。" }

@@ -54,6 +54,8 @@ final class IntelligenceController: ObservableObject {
     @Published var lastError: String?
     @Published private(set) var answer: AIReview?
     @Published private(set) var reviewProgress: AIReviewProgress?
+    @Published private(set) var pendingDeletionCount = 0
+    @Published private(set) var deletionCleanupError: String?
 
     let store: ClipStore
     private var disk: IntelligenceDisk?
@@ -75,6 +77,9 @@ final class IntelligenceController: ObservableObject {
     private var executionAllowed = false
     private var automaticReviewAttempts: [String: Date] = [:]
     private var activeWorkerIsManual = false
+    private var pendingDeletionIDs: Set<UUID> = []
+    private var reconciledDeletionIDs: Set<UUID> = []
+    private var deletionValidationFailed = false
 
     static var supportedLocales: [Locale] { LocalSpeechTranscriber.supportedLocales }
     var hasAPIKey: Bool { ((try? IntelligenceKeychain.read()) ?? nil)?.isEmpty == false }
@@ -87,11 +92,12 @@ final class IntelligenceController: ObservableObject {
     init(store: ClipStore) {
         self.store = store
         do {
+            let authoritativeDeleted = try store.deletedClipIDs()
             let storage = try IntelligenceDisk(root: store.root)
             let snapshot = try storage.load()
             let restored = try storage.documents()
             disk = storage; settings = snapshot.settings; savedSettings = snapshot.settings
-            excludedClipIDs = Set(snapshot.excludedClipIDs ?? [])
+            excludedClipIDs = Set(snapshot.excludedClipIDs ?? []).union(authoritativeDeleted)
             documents = restored.filter { !excludedClipIDs.contains($0.clipID) }
             func current(_ source: SourceCitation) -> Bool {
                 documents.contains { document in document.clipID == source.clipID && document.segments.contains {
@@ -112,11 +118,20 @@ final class IntelligenceController: ObservableObject {
                 if job.state == .running { job.state = .paused; job.error = "上次转写中断，可从已保存窗口续接。" }
                 return job
             }
+            filterDeletedContent()
             try persist()
             refresh()
         } catch {
             disk = nil; lastError = "无法读取本地智能记录：\(error.localizedDescription)。已有文件未覆盖。"
             status = "本地索引不可用"
+            if let deleted = try? store.deletedClipIDs() {
+                excludedClipIDs.formUnion(deleted); filterDeletedContent()
+                pendingDeletionIDs.formUnion(excludedClipIDs); pendingDeletionCount = pendingDeletionIDs.count
+            } else {
+                deletionValidationFailed = true
+                documents = []; reviews = []; searchResults = []; answer = nil
+                memories.removeAll { !$0.sourceCitations.isEmpty || $0.inputClipIDs != nil }
+            }
         }
         archiveObserver = NotificationCenter.default.addObserver(forName: .archiveChanged, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
@@ -140,6 +155,35 @@ final class IntelligenceController: ObservableObject {
     }
 
     func refresh() {
+        do {
+            let authoritative = try store.deletedClipIDs()
+            let newlyDeleted = authoritative.subtracting(excludedClipIDs)
+            if !newlyDeleted.isEmpty { invalidateAIWork() }
+            excludedClipIDs.formUnion(authoritative)
+            if deletionValidationFailed || disk == nil {
+                let storage = try disk ?? IntelligenceDisk(root: store.root)
+                let snapshot = try storage.load()
+                excludedClipIDs.formUnion(snapshot.excludedClipIDs ?? [])
+                documents = try storage.documents().filter { !excludedClipIDs.contains($0.clipID) }
+                reviews = snapshot.reviews.filter { reviewAllowedAfterDeletion($0) }
+                memories = snapshot.memories.filter { memoryAllowedAfterDeletion($0) }
+                jobs = snapshot.jobs.filter { !excludedClipIDs.contains($0.clipID) }
+                settings = snapshot.settings; savedSettings = snapshot.settings; disk = storage
+            }
+            deletionValidationFailed = false
+            filterDeletedContent()
+            try reconcileDeletedContent()
+        } catch {
+            // A malformed deletion receipt must not let an earlier snapshot resurrect text.
+            if (try? store.deletedClipIDs()) == nil {
+                deletionValidationFailed = true
+                processTask?.cancel(); speech.cancel(); remoteSpeech.cancel(); invalidateAIWork()
+                documents = []; reviews = []; searchResults = []; answer = nil
+                memories.removeAll { !$0.sourceCitations.isEmpty || $0.inputClipIDs != nil }
+            }
+            deletionCleanupError = error.localizedDescription; report(error)
+            return
+        }
         guard disk != nil else { return }
         do {
             clipIndex = Dictionary(uniqueKeysWithValues: try store.clips().map { ($0.id, $0) })
@@ -149,6 +193,8 @@ final class IntelligenceController: ObservableObject {
             }
         } catch { report(error) }
     }
+
+    func retryPendingDeletions() { refresh() }
 
     func saveSettings() {
         if settings.apiBaseURL != savedSettings.apiBaseURL {
@@ -333,21 +379,13 @@ final class IntelligenceController: ObservableObject {
     }
 
     func deleteContent(for clipID: UUID) throws {
-        guard let disk else { throw IntelligenceError.message("本地智能记录存储不可用。") }
         excludedClipIDs.insert(clipID)
+        pendingDeletionIDs.insert(clipID); reconciledDeletionIDs.remove(clipID)
         if activeClipID == clipID { pauseTranscription() }
         // A pending remote response may still include this text, so do not commit that result.
         invalidateAIWork()
-        jobs.removeAll { $0.clipID == clipID }
-        documents.removeAll { $0.clipID == clipID }
-        reviews.removeAll { $0.inputClipIDs == nil || $0.inputClipIDs?.contains(clipID) == true || $0.citations.contains { $0.clipID == clipID } }
-        memories.removeAll { ($0.inputClipIDs == nil && !$0.sourceCitations.isEmpty) || $0.inputClipIDs?.contains(clipID) == true || $0.sourceCitations.contains { $0.clipID == clipID } }
-        searchGeneration = UUID(); searchResults.removeAll { $0.clipID == clipID }
-        if let current = answer, current.inputClipIDs == nil || current.inputClipIDs?.contains(clipID) == true || current.citations.contains(where: { $0.clipID == clipID }) { answer = nil }
-        try persist()
-        try disk.deleteDocument(clipID)
-        try disk.deleteAICaches(containing: clipID); reviewProgress = nil
-        try removeProcessingHold(clipID)
+        filterDeletedContent()
+        try reconcileDeletedContent()
         lastError = nil
     }
 
@@ -773,6 +811,7 @@ final class IntelligenceController: ObservableObject {
         else { try disk?.save(document); upsert(document) }
     }
     private func persist() throws {
+        guard !deletionValidationFailed else { throw IntelligenceError.message("删除记录暂时无法验证，智能记录已隐藏，请稍后重试。") }
         guard let disk else { throw IntelligenceError.message("本地智能记录存储不可用。") }
         try disk.save(IntelligenceSnapshot(settings: settings, jobs: jobs, reviews: reviews, memories: memories,
                                            excludedClipIDs: Array(excludedClipIDs), transcriptionPaused: queuePaused,
@@ -788,4 +827,61 @@ final class IntelligenceController: ObservableObject {
     }
     private func sameDay(_ a: Date, _ b: Date) -> Bool { DailySchedule().calendar.isDate(a, inSameDayAs: b) }
     private func report(_ error: Error) { lastError = error.localizedDescription; status = "需要处理" }
+
+    private func reviewAllowedAfterDeletion(_ value: AIReview) -> Bool {
+        guard !excludedClipIDs.isEmpty else { return true }
+        guard let inputs = value.inputClipIDs else { return false }
+        return excludedClipIDs.isDisjoint(with: inputs) && !value.citations.contains { excludedClipIDs.contains($0.clipID) }
+    }
+    private func memoryAllowedAfterDeletion(_ value: MemoryFact) -> Bool {
+        guard !excludedClipIDs.isEmpty else { return true }
+        if value.sourceCitations.contains(where: { excludedClipIDs.contains($0.clipID) }) { return false }
+        if let inputs = value.inputClipIDs { return excludedClipIDs.isDisjoint(with: inputs) }
+        return value.sourceCitations.isEmpty // A manually entered fact has no recording dependency.
+    }
+    private func filterDeletedContent() {
+        guard !excludedClipIDs.isEmpty else { return }
+        if let activeClipID, excludedClipIDs.contains(activeClipID) {
+            processTask?.cancel(); speech.cancel(); remoteSpeech.cancel()
+        }
+        let keptDocuments = documents.filter { !excludedClipIDs.contains($0.clipID) }
+        let keptReviews = reviews.filter { reviewAllowedAfterDeletion($0) }
+        let keptMemories = memories.filter { memoryAllowedAfterDeletion($0) }
+        if keptDocuments.count != documents.count { documents = keptDocuments; searchGeneration = UUID() }
+        if keptReviews.count != reviews.count { reviews = keptReviews }
+        if keptMemories.count != memories.count { memories = keptMemories }
+        jobs.removeAll { excludedClipIDs.contains($0.clipID) }
+        searchResults.removeAll { excludedClipIDs.contains($0.clipID) }
+        if let current = answer, !reviewAllowedAfterDeletion(current) { answer = nil }
+    }
+    /// The authoritative tombstone remains until all unrelated modules have independently
+    /// reconciled it. Physical deletion errors never unhide the filtered records.
+    private func reconcileDeletedContent() throws {
+        let targets = excludedClipIDs.subtracting(reconciledDeletionIDs).union(pendingDeletionIDs)
+        guard !targets.isEmpty else { pendingDeletionCount = 0; deletionCleanupError = nil; return }
+        pendingDeletionIDs.formUnion(targets); pendingDeletionCount = pendingDeletionIDs.count
+        guard let disk else {
+            let error = IntelligenceError.message("相关文字已隐藏，仍有 \(pendingDeletionCount) 项等待本机存储恢复后清理。")
+            deletionCleanupError = error.localizedDescription; throw error
+        }
+        var firstError: Error?, stateSaved = true
+        do { try persist() } catch { stateSaved = false; firstError = error }
+        var rawPending: Set<UUID> = []
+        do { try store.purgeDeletedAudio(only: targets) }
+        catch {
+            if firstError == nil { firstError = error }
+            rawPending = (try? store.pendingDeletedAudioIDs(only: targets)) ?? targets
+        }
+        for id in targets {
+            var completed = stateSaved && !rawPending.contains(id)
+            do { try disk.deleteDocument(id) } catch { completed = false; if firstError == nil { firstError = error } }
+            do { try disk.deleteAICaches(containing: id) } catch { completed = false; if firstError == nil { firstError = error } }
+            do { try removeProcessingHold(id) } catch { completed = false; if firstError == nil { firstError = error } }
+            if completed { pendingDeletionIDs.remove(id); reconciledDeletionIDs.insert(id) }
+        }
+        reviewProgress = nil
+        pendingDeletionCount = pendingDeletionIDs.count
+        if let firstError { deletionCleanupError = firstError.localizedDescription; throw firstError }
+        deletionCleanupError = nil
+    }
 }
