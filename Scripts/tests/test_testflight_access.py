@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+import urllib.error
 
 SCRIPT = Path(__file__).resolve().parents[1] / "testflight_access.py"
 spec = importlib.util.spec_from_file_location("testflight_access", SCRIPT)
@@ -17,7 +18,8 @@ def resource(kind, identity, **attrs):
 
 def options(**kwargs):
     values = dict(mode="check", bundle_id="com.aimanjack.daytape", build_number="42.1",
-        marketing_version="0.5.0", internal_group_id=None, tester_id=[], declare_exempt=False)
+        marketing_version="0.5.0", internal_group_id=None, tester_id=[], declare_exempt=False,
+        invite_existing_owner=False)
     values.update(kwargs)
     return SimpleNamespace(**values)
 
@@ -29,10 +31,11 @@ class FakeASC:
             usesNonExemptEncryption=False)
         self.state = "IN_BETA_TESTING"
         self.groups = [resource("betaGroups", "g1", name="Internal", isInternalGroup=True, hasAccessToAllBuilds=False)]
-        self.people = {"g1": [resource("betaTesters", "tester1", state="INSTALLED")]}
+        self.people = {"g1": [resource("betaTesters", "tester1", state="INSTALLED", email="owner@example.com")]}
         self.assigned = {"g1": [dict(type="builds", id="build1")]}
         self.users = [resource("users", "user1", username="owner@example.com", roles=["ACCOUNT_HOLDER", "ADMIN"], allAppsVisible=True)]
         self.users_denied = False
+        self.invitation_result_state = "INVITED"
 
     def listing(self, path, params=None):
         self.calls.append(("GET", path, params))
@@ -67,6 +70,13 @@ class FakeASC:
         if method == "POST" and path.endswith("/relationships/betaTesters"):
             gid = path.split("/")[3]
             self.people[gid] += [resource("betaTesters", t["id"], state="ACCEPTED") for t in body["data"]]
+            return {}
+        if method == "POST" and path == "/v1/betaTesterInvitations":
+            tester = body["data"]["relationships"]["betaTester"]["data"]["id"]
+            for people in self.people.values():
+                for person in people:
+                    if person["id"] == tester:
+                        person["attributes"]["state"] = self.invitation_result_state
             return {}
         raise AssertionError("Unexpected API mutation")
 
@@ -174,6 +184,82 @@ class TestFlightAccessTests(unittest.TestCase):
         with self.assertRaises(tf.AccessError):
             api.listing("/v1/users")
         self.assertEqual(calls, ["/v1/users"])
+
+    def test_explicit_owner_invitation_binds_app_and_existing_tester_after_casefold_match(self):
+        api = FakeASC(); api.people["g1"][0]["attributes"]["state"] = "NOT_INVITED"
+        api.users[0]["attributes"]["username"] = "OWNER@EXAMPLE.COM"
+        report = tf.inspect_access(api, options(mode="ensure", invite_existing_owner=True))
+        self.assertTrue(report["owner_verified"])
+        self.assertEqual(report["owner_tester_state"], "INVITED")
+        self.assertFalse(report["ready"])
+        self.assertEqual(report["reason"], "ACCEPT_EXISTING_INVITATION")
+        self.assertNotIn("owner@example.com", json.dumps(report).lower())
+        invitations = [c for c in api.calls if c[0] == "POST"]
+        self.assertEqual(invitations, [("POST", "/v1/betaTesterInvitations", {"data": {
+            "type": "betaTesterInvitations", "relationships": {
+                "app": {"data": {"type": "apps", "id": "app1"}},
+                "betaTester": {"data": {"type": "betaTesters", "id": "tester1"}}}}})])
+        # The final state is obtained from a GET after the mutation, not its response.
+        self.assertEqual(api.calls[-1][1], "/v1/betaGroups/g1/betaTesters")
+
+    def test_owner_identity_mismatch_cannot_invite_or_create_any_tester(self):
+        api = FakeASC(); api.people["g1"][0]["attributes"].update(state="NOT_INVITED", email="other@example.com")
+        with self.assertRaises(tf.AccessError):
+            tf.inspect_access(api, options(mode="ensure", invite_existing_owner=True))
+        self.assertTrue(all(c[0] == "GET" for c in api.calls))
+
+    def test_multiple_account_holders_or_multiple_matching_testers_are_rejected(self):
+        for multiple_owners in (True, False):
+            api = FakeASC(); api.people["g1"][0]["attributes"]["state"] = "NOT_INVITED"
+            if multiple_owners:
+                api.users.append(resource("users", "user2", roles=["ACCOUNT_HOLDER"], username="second@example.com"))
+            else:
+                api.people["g1"].append(resource("betaTesters", "tester2", state="NOT_INVITED", email="OWNER@example.com"))
+            with self.assertRaises(tf.AccessError):
+                tf.inspect_access(api, options(mode="ensure", invite_existing_owner=True))
+            self.assertTrue(all(c[0] == "GET" for c in api.calls))
+
+    def test_already_invited_accepted_or_installed_owner_is_never_reinvited(self):
+        for state in ("INVITED", "ACCEPTED", "INSTALLED"):
+            api = FakeASC(); api.people["g1"][0]["attributes"]["state"] = state
+            report = tf.inspect_access(api, options(mode="ensure", invite_existing_owner=True))
+            self.assertEqual(report["owner_tester_state"], state)
+            self.assertEqual(report["ready"], state != "INVITED")
+            self.assertTrue(all(c[0] == "GET" for c in api.calls))
+
+    def test_lagging_authoritative_state_is_not_assumed_invited_or_sent_twice(self):
+        api = FakeASC(); api.people["g1"][0]["attributes"]["state"] = "NOT_INVITED"
+        api.invitation_result_state = "NOT_INVITED"
+        config = options(mode="ensure", invite_existing_owner=True)
+        for _ in range(2):
+            report = tf.inspect_access(api, config)
+            self.assertFalse(report["ready"])
+            self.assertEqual(report["owner_tester_state"], "NOT_INVITED")
+            self.assertEqual(report["reason"], "OWNER_INVITATION_AWAITING_CONFIRMATION")
+        self.assertEqual(sum(c[0] == "POST" for c in api.calls), 1)
+
+    def test_other_accepted_member_cannot_hide_owner_pending_invitation(self):
+        api = FakeASC(); api.people["g1"][0]["attributes"]["state"] = "NOT_INVITED"
+        api.people["g1"].append(resource("betaTesters", "tester2", state="INSTALLED", email="other@example.com"))
+        report = tf.inspect_access(api, options(mode="ensure", invite_existing_owner=True))
+        self.assertEqual(report["accepted_testers"], 1)
+        self.assertEqual(report["reason"], "ACCEPT_EXISTING_INVITATION")
+        self.assertFalse(report["ready"])
+
+    def test_invitation_network_failure_never_retries_ambiguous_send_or_echoes_identity(self):
+        api = object.__new__(tf.ASC)
+        api.token = lambda: "not-a-real-token"
+        class FailingNetwork:
+            calls = 0
+            def open(self, req, timeout):
+                self.calls += 1
+                raise urllib.error.URLError("owner@example.com not-a-real-token")
+        api.opener = FailingNetwork()
+        with self.assertRaises(tf.AccessError) as error:
+            api.request("POST", "/v1/betaTesterInvitations", body={"data": {}})
+        self.assertEqual(api.opener.calls, 1)
+        self.assertNotIn("owner@example.com", str(error.exception))
+        self.assertNotIn("not-a-real-token", str(error.exception))
 
     def test_jwt_is_es256_and_contains_only_the_required_short_lived_claims(self):
         from cryptography.hazmat.primitives import serialization, hashes

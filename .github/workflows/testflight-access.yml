@@ -25,6 +25,10 @@ on:
         description: Explicitly apply the source plist's existing exemption only if ASC declaration is missing
         type: boolean
         default: false
+      invite_existing_owner:
+        description: Explicitly invite only the existing NOT_INVITED tester proven to match the unique Account Holder (ensure only)
+        type: boolean
+        default: false
       wait_minutes:
         description: Maximum processing/access wait; inspect never waits
         type: choice
@@ -77,6 +81,7 @@ jobs:
           TF_ACCESS_MARKETING_VERSION: ${{ inputs.marketing_version }}
           ASC_INTERNAL_GROUP_ID: ${{ inputs.internal_group_id || vars.ASC_INTERNAL_GROUP_ID }}
           TF_DECLARE_EXEMPT: ${{ inputs.declare_exempt }}
+          TF_INVITE_EXISTING_OWNER: ${{ inputs.invite_existing_owner }}
           TF_WAIT_MINUTES: ${{ inputs.wait_minutes }}
         run: |
           set +x
@@ -93,5 +98,7 @@ jobs:
               args += ['--internal-group-id', os.environ['ASC_INTERNAL_GROUP_ID']]
           if os.environ.get('TF_DECLARE_EXEMPT') == 'true':
               args += ['--declare-exempt']
+          if os.environ.get('TF_INVITE_EXISTING_OWNER') == 'true':
+              args += ['--invite-existing-owner']
           sys.exit(subprocess.call(args))
           PY

@@ -3,14 +3,16 @@
 
 Runs with the three existing ASC secrets only on trusted main GitHub Actions.
 Dependencies: Tools/requirements.txt (install before exposing deployment secrets).
-Default check mode makes GET requests only. It never creates beta testers, invites
-accounts, enables public links, or submits external beta review.
+Default check mode makes GET requests only. An explicit ensure-only flag may
+invite the existing tester proven to match the unique Account Holder. It never
+creates testers, invites other accounts, enables public links, or submits review.
 
 Apple API references:
 https://developer.apple.com/documentation/appstoreconnectapi/get-v1-builds
 https://developer.apple.com/documentation/appstoreconnectapi/internalbetastate
 https://developer.apple.com/documentation/appstoreconnectapi/post-v1-builds-_id_-relationships-betagroups
 https://developer.apple.com/documentation/appstoreconnectapi/patch-v1-builds-_id_
+https://developer.apple.com/documentation/appstoreconnectapi/post-v1-betatesterinvitations
 https://developer.apple.com/help/app-store-connect/test-a-beta-version/add-internal-testers/
 """
 from __future__ import annotations
@@ -109,6 +111,9 @@ class ASC:
         url = trusted_url(path)
         if params:
             url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+        # Invitation sends are not idempotent. A lost response must be inspected,
+        # never retried automatically while Apple's state may still be catching up.
+        retry_allowed = not (method == "POST" and urllib.parse.urlsplit(url).path == "/v1/betaTesterInvitations")
         for attempt in range(3):
             req = urllib.request.Request(url, method=method,
                 headers={"Authorization": "Bearer " + self.token(), "Accept": "application/json", "Content-Type": "application/json"},
@@ -120,7 +125,7 @@ class ASC:
                     raise AccessError("ASC response exceeded the bounded size.")
                 return json.loads(data) if data else {}
             except urllib.error.HTTPError as error:
-                if error.code in (429, 500, 502, 503, 504) and attempt < 2:
+                if retry_allowed and error.code in (429, 500, 502, 503, 504) and attempt < 2:
                     time.sleep(2 ** attempt * 3)
                     continue
                 try:
@@ -130,10 +135,10 @@ class ASC:
                 # Never include response detail, request URL, headers, or exception repr.
                 raise APIError(error.code, codes) from None
             except (urllib.error.URLError, TimeoutError):
-                if attempt < 2:
+                if retry_allowed and attempt < 2:
                     time.sleep(2 ** attempt * 3)
                     continue
-                raise AccessError("ASC network request failed after bounded retries.") from None
+                raise AccessError("ASC network request failed; inspect server state before retrying a mutation.") from None
             except (ValueError, UnicodeError):
                 raise AccessError("ASC returned invalid JSON.") from None
 
@@ -254,6 +259,52 @@ def inspect_inventory(api, options):
     return report
 
 
+def invite_existing_owner(api, app_id, group, attempted):
+    """Prove membership and owner equality in CI; return only state/count metadata."""
+    if attributes(group).get("isInternalGroup") is not True:
+        raise AccessError("Owner invitation requires an existing internal group.")
+    users = api.listing("/v1/users", {"fields[users]": "roles,username", "limit": 200})
+    owners = [u for u in users if "ACCOUNT_HOLDER" in attributes(u).get("roles", [])]
+    if len(owners) != 1:
+        raise AccessError("Owner invitation requires exactly one Account Holder.")
+    username = attributes(owners[0]).get("username")
+    if not isinstance(username, str) or "@" not in username or any(c.isspace() for c in username):
+        raise AccessError("The Account Holder identity cannot be verified.")
+    # Emails stay only in CI memory and are never added to reports or exceptions.
+    gid = identifier(group["id"])
+    people = api.listing(f"/v1/betaGroups/{gid}/betaTesters",
+        {"fields[betaTesters]": "email,state", "limit": 200})
+    matches = [p for p in people if isinstance(attributes(p).get("email"), str)
+        and attributes(p)["email"].casefold() == username.casefold()]
+    if len(matches) != 1:
+        raise AccessError("Selected internal group must contain exactly one existing tester matching the Account Holder.")
+    owner = matches[0]
+    owner_id = identifier(owner["id"])
+    state = attributes(owner).get("state")
+    if state not in ("NOT_INVITED", "INVITED", "ACCEPTED", "INSTALLED", "REVOKED"):
+        raise AccessError("The existing owner tester has an unknown invitation state.")
+    if state == "NOT_INVITED" and owner_id not in attempted:
+        # Mark BEFORE issuing the request: success with a lost response must not
+        # cause the polling loop to send again while GET still says NOT_INVITED.
+        attempted.add(owner_id)
+        api.request("POST", "/v1/betaTesterInvitations", body={"data": {
+            "type": "betaTesterInvitations", "relationships": {
+                "app": {"data": {"type": "apps", "id": identifier(app_id)}},
+                # Deprecated in Apple's schema but kept explicitly: app-only is
+                # not an acceptable fallback for this single-owner permission.
+                "betaTester": {"data": {"type": "betaTesters", "id": owner_id}}
+            }}})
+        people = testers(api, group)
+        current = [p for p in people if p.get("id") == owner_id]
+        if len(current) != 1:
+            raise AccessError("Owner invitation request sent; authoritative tester state could not be confirmed.")
+        state = attributes(current[0]).get("state")
+        if state not in ("NOT_INVITED", "INVITED", "ACCEPTED", "INSTALLED", "REVOKED"):
+            raise AccessError("Owner invitation request sent; authoritative state is not recognized.")
+    return {"owner_verified": True, "owner_tester_state": state,
+        "owner_invitation_attempted": owner_id in attempted}, people
+
+
 def inspect_access(api, options):
     """One bounded pass, injectable API for offline tests; no private data returned."""
     app_id = find_app(api, options.bundle_id)
@@ -319,6 +370,22 @@ def inspect_access(api, options):
             body={"data": [{"type": "betaGroups", "id": gid}]})
         report["reason"] = "BUILD_ASSIGNED_WAITING"
         return report
+    if assigned and options.mode == "ensure" and getattr(options, "invite_existing_owner", False):
+        if not hasattr(options, "owner_invitation_attempts"):
+            options.owner_invitation_attempts = set()
+        owner_report, members[gid] = invite_existing_owner(api, app_id, group, options.owner_invitation_attempts)
+        report.update(owner_report)
+        accepted = sum(attributes(t).get("state") in ("ACCEPTED", "INSTALLED") for t in members[gid])
+        report["accepted_testers"] = accepted
+        if report["owner_tester_state"] == "NOT_INVITED":
+            report["reason"] = "OWNER_INVITATION_AWAITING_CONFIRMATION"
+            return report
+        if report["owner_tester_state"] == "INVITED":
+            report["reason"] = "ACCEPT_EXISTING_INVITATION"
+            return report
+        if report["owner_tester_state"] == "REVOKED":
+            report["reason"] = "OWNER_STATE_REQUIRES_ACTION"
+            return report
     if not assigned:
         report["reason"] = "BUILD_NOT_ASSIGNED"
     elif missing:
@@ -341,11 +408,15 @@ def main(argv=None):
     parser.add_argument("--internal-group-id", default=os.environ.get("ASC_INTERNAL_GROUP_ID"))
     parser.add_argument("--tester-id", action="append", default=[])
     parser.add_argument("--declare-exempt", action="store_true", help="Explicitly apply the source plist's existing false declaration if compliance is missing")
+    parser.add_argument("--invite-existing-owner", action="store_true",
+        help="Ensure only: invite a NOT_INVITED tester already in the selected internal group, only after unique Account Holder equality is proved")
     parser.add_argument("--timeout-seconds", type=int, default=0, help="Poll for up to this time (maximum 7200); 0 means one check")
     parser.add_argument("--poll-seconds", type=int, default=30)
     options = parser.parse_args(argv)
     if options.mode == "ensure" and not options.build_number:
         parser.error("ensure requires an exact --build-number")
+    if options.invite_existing_owner and options.mode != "ensure":
+        parser.error("--invite-existing-owner requires ensure mode")
     if not 0 <= options.timeout_seconds <= 7200 or not 1 <= options.poll_seconds <= 60:
         parser.error("invalid bounded polling interval")
     try:
@@ -369,7 +440,7 @@ def main(argv=None):
                 # API availability cannot prove installation on the user's physical device.
                 return 0
             if report["reason"] in ("PROCESSING_FAILED", "BUILD_EXPIRED", "NO_INTERNAL_TESTERS", "ACCEPT_EXISTING_INVITATION",
-                    "EXPORT_COMPLIANCE_REQUIRES_ACTION", "INTERNAL_STATE_REQUIRES_ACTION"):
+                    "EXPORT_COMPLIANCE_REQUIRES_ACTION", "INTERNAL_STATE_REQUIRES_ACTION", "OWNER_STATE_REQUIRES_ACTION"):
                 return 3
             if time.monotonic() >= deadline:
                 return 3
