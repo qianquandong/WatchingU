@@ -1,0 +1,12 @@
+DayTape minimal app icon
+Mode: built-in image_gen, new generation followed by one targeted color-treatment edit.
+Asset export: resize generated 1254x1254 RGB PNG to 1024x1024 24-bit RGB with high-quality bicubic interpolation. No creative bitmap editing.
+
+Generation prompt:
+Create a new original minimal iPhone and Apple Watch recorder icon. Full-square opaque dark near-black green background #101A17. Center exactly three thick mint #8DF0C8 vertical rounded capsules, short/tall/short, symmetric and vertically centered. Tall bar approximately 54% of canvas height; sides approximately 28%; whole mark approximately 48% of width. Circle-safe margins at least 22%. No text, borders, manual corner mask, gradients, textures, shadows, gloss, 3D, mockup or watermark.
+
+Targeted edit prompt:
+Preserve three-capsule geometry, position, spacing, rounded ends and square composition; change only treatment toward uniform solid background #101A17 and capsule fill #8DF0C8, with clean edge antialiasing; remove gradients, lighting, glow, texture, grain, noise, bevel and surface variation.
+
+Visual result:
+Three-capsule sound mark, no text, generous margins. Model output retains a very subtle tonal texture despite the requested flat treatment; it is not a mathematically exact two-color vector. Opaque RGB, 1024x1024, 8 bits per channel, no alpha/tRNS.

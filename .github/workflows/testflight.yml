@@ -21,7 +21,6 @@ concurrency:
 
 jobs:
   upload:
-    if: github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 45
     env:
@@ -32,6 +31,14 @@ jobs:
       GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_CLIENT_ID }}
       APPLE_SIGNING_STYLE: ${{ vars.APPLE_SIGNING_STYLE || 'automatic' }}
     steps:
+      - name: Require the release branch
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo '::error::TestFlight must run on main. Merge the release changes to main, then dispatch this workflow on main.'
+            exit 1
+          fi
+
       - name: Check out main
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

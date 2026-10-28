@@ -73,6 +73,42 @@ for name in required:
 print('Required configuration is present for build mode ' + os.environ['TF_BUILD_MODE'] + '.')
 PY
 
+# Reject missing or transparent store icons before the full build and upload.
+# Asset catalogs compile the same opaque 1024px source for both app platforms.
+python3 - <<'PY'
+import json
+import struct
+from pathlib import Path
+
+for folder, platform in [('Phone', 'ios'), ('Watch', 'watchos')]:
+    catalog = Path(folder) / 'Assets.xcassets/AppIcon.appiconset'
+    contents = json.loads((catalog / 'Contents.json').read_text(encoding='utf-8'))
+    entries = [entry for entry in contents.get('images', [])
+               if entry.get('idiom') == 'universal' and entry.get('platform') == platform
+               and entry.get('size') == '1024x1024']
+    if len(entries) != 1 or not entries[0].get('filename'):
+        raise SystemExit(folder + ' needs one named universal 1024x1024 AppIcon source.')
+    icon = (catalog / entries[0]['filename']).resolve()
+    if not icon.is_relative_to(catalog.resolve()) or not icon.is_file():
+        raise SystemExit(folder + ' AppIcon source is missing or outside its asset catalog.')
+    data = icon.read_bytes()
+    if len(data) < 33 or data[:8] != b'\x89PNG\r\n\x1a\n' or data[12:16] != b'IHDR':
+        raise SystemExit(folder + ' AppIcon must be a valid PNG.')
+    width, height, depth, color = struct.unpack('>IIBB', data[16:26])
+    if (width, height, depth, color) != (1024, 1024, 8, 2):
+        raise SystemExit(folder + ' AppIcon must be 1024x1024, 8-bit RGB with no alpha channel.')
+    offset = 8
+    while offset + 12 <= len(data):
+        length = struct.unpack('>I', data[offset:offset + 4])[0]
+        kind = data[offset + 4:offset + 8]
+        if kind == b'tRNS':
+            raise SystemExit(folder + ' AppIcon must not contain PNG transparency.')
+        offset += length + 12
+        if kind == b'IEND':
+            break
+    print(folder + ' AppIcon source is present, opaque RGB, and 1024x1024.')
+PY
+
 # Since April 28, 2026 Apple requires Xcode 26+ and current platform SDKs
 # for App Store Connect uploads. Deployment targets may remain iOS 17/Watch 10.
 python3 - <<'PY'

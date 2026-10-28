@@ -1,0 +1,97 @@
+name: TestFlight access
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Read-only inventory/check, or enable the exact uploaded build for existing internal testers
+        type: choice
+        required: true
+        default: inspect
+        options: [inspect, check, ensure]
+      build_number:
+        description: Exact CFBundleVersion; required for ensure
+        type: string
+        required: false
+      marketing_version:
+        description: CFBundleShortVersionString
+        type: string
+        default: '0.5.0'
+      internal_group_id:
+        description: Existing internal group ID; blank selects the unique populated internal group
+        type: string
+        required: false
+      declare_exempt:
+        description: Explicitly apply the source plist's existing exemption only if ASC declaration is missing
+        type: boolean
+        default: false
+      wait_minutes:
+        description: Maximum processing/access wait; inspect never waits
+        type: choice
+        default: '45'
+        options: ['0', '15', '45', '90']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testflight-access
+  cancel-in-progress: false
+
+jobs:
+  access:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - name: Require trusted main
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo '::error::TestFlight access must run on main.'
+            exit 1
+          fi
+
+      - name: Check out trusted main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      # Install dependencies and run tests BEFORE exposing deployment credentials.
+      - name: Prepare helper runtime and offline tests
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/daytape-asc-venv"
+          "$RUNNER_TEMP/daytape-asc-venv/bin/python" -m pip install -r Tools/requirements.txt
+          "$RUNNER_TEMP/daytape-asc-venv/bin/python" -m unittest discover -s Scripts/tests -p 'test_testflight_access.py' -v
+
+      - name: Inspect or verify existing internal TestFlight access
+        shell: bash
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64 }}
+          DAYTAPE_BUNDLE_PREFIX: ${{ vars.DAYTAPE_BUNDLE_PREFIX || 'com.aimanjack.daytape' }}
+          TF_ACCESS_MODE: ${{ inputs.mode }}
+          TF_ACCESS_BUILD_NUMBER: ${{ inputs.build_number }}
+          TF_ACCESS_MARKETING_VERSION: ${{ inputs.marketing_version }}
+          ASC_INTERNAL_GROUP_ID: ${{ inputs.internal_group_id || vars.ASC_INTERNAL_GROUP_ID }}
+          TF_DECLARE_EXEMPT: ${{ inputs.declare_exempt }}
+          TF_WAIT_MINUTES: ${{ inputs.wait_minutes }}
+        run: |
+          set +x
+          "$RUNNER_TEMP/daytape-asc-venv/bin/python" - <<'PY'
+          import os
+          import subprocess
+          import sys
+          args = [sys.executable, 'Scripts/testflight_access.py', '--mode', os.environ['TF_ACCESS_MODE'],
+                  '--marketing-version', os.environ['TF_ACCESS_MARKETING_VERSION'],
+                  '--timeout-seconds', str(int(os.environ['TF_WAIT_MINUTES']) * 60)]
+          if os.environ.get('TF_ACCESS_BUILD_NUMBER'):
+              args += ['--build-number', os.environ['TF_ACCESS_BUILD_NUMBER']]
+          if os.environ.get('ASC_INTERNAL_GROUP_ID'):
+              args += ['--internal-group-id', os.environ['ASC_INTERNAL_GROUP_ID']]
+          if os.environ.get('TF_DECLARE_EXEMPT') == 'true':
+              args += ['--declare-exempt']
+          sys.exit(subprocess.call(args))
+          PY

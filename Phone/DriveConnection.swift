@@ -40,6 +40,7 @@ final class DriveConnection: ObservableObject {
         try update(result.user)
     }
     func access(expectedAccount: String? = nil) async throws -> (token: String, account: String) {
+        guard configured else { throw CloudArchiveError.setupRequired }
         if GIDSignIn.sharedInstance.currentUser == nil { try await restore() }
         guard let current = GIDSignIn.sharedInstance.currentUser else { throw CloudArchiveError.signInRequired }
         let user = try await current.refreshTokensIfNeeded()
