@@ -7,7 +7,11 @@ on:
         description: Inspect the secret-configured recipient or invite that eligible existing user to the existing internal group
         type: choice
         default: inspect
-        options: [inspect, invite-internal]
+        options: [inspect, prepare-access, invite-internal]
+      grant_app_access:
+        description: Only after explicit approval, add WatchingU to the existing recipient's Developer app access before inviting
+        type: boolean
+        default: false
       build_number:
         description: Exact existing CFBundleVersion
         type: string
@@ -62,6 +66,7 @@ jobs:
           TF_INVITATION_BUILD: ${{ inputs.build_number }}
           TF_INVITATION_VERSION: ${{ inputs.marketing_version }}
           TF_INVITATION_GROUP: ${{ inputs.internal_group_id }}
+          TF_GRANT_APP_ACCESS: ${{ inputs.grant_app_access }}
         run: |
           set +x
           "$RUNNER_TEMP/daytape-recipient-venv/bin/python" - <<'PY'
@@ -70,6 +75,16 @@ jobs:
           import sys
           if os.environ.get('TF_INVITATION_EMAIL'):
               print('::add-mask::' + os.environ['TF_INVITATION_EMAIL'], flush=True)
+          if (os.environ['TF_INVITATION_BUILD'], os.environ['TF_INVITATION_VERSION'],
+              os.environ['TF_INVITATION_GROUP']) != ('5.1', '0.5.0', 'd43af501-25bb-4009-9a88-ac6cad53ef36'):
+              raise SystemExit('The intended build or internal group changed; no operation was performed.')
+          mode = os.environ['TF_INVITATION_MODE']
+          if os.environ.get('TF_GRANT_APP_ACCESS') == 'true':
+              if mode != 'invite-internal':
+                  raise SystemExit('App access can be granted only with an explicitly approved invitation.')
+              subprocess.run([sys.executable, 'Scripts/testflight_app_access.py', '--apply'], check=True)
+          elif mode == 'prepare-access':
+              sys.exit(subprocess.call([sys.executable, 'Scripts/testflight_app_access.py']))
           args = [sys.executable, 'Scripts/testflight_recipient.py',
                   '--mode', os.environ['TF_INVITATION_MODE'],
                   '--build-number', os.environ['TF_INVITATION_BUILD'],
