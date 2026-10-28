@@ -44,6 +44,12 @@ final class Connectivity: NSObject, ObservableObject, WCSessionDelegate {
         } catch { report(error) }
         #endif
         if session.activationState == .activated {
+            #if os(iOS)
+            guard session.isPaired else { status = "请先在 iPhone 配对 Apple Watch"; return }
+            guard session.isWatchAppInstalled else { status = "请先在 Apple Watch 安装 DayTape"; return }
+            #elseif os(watchOS)
+            guard session.isCompanionAppInstalled else { status = "请先在 iPhone 安装 DayTape"; return }
+            #endif
             status = session.isReachable ? "配对设备可达" : "已配对 · 等待系统传输"
         } else { status = "传输会话未就绪" }
     }
@@ -141,6 +147,11 @@ final class Connectivity: NSObject, ObservableObject, WCSessionDelegate {
     func configureRoutine(_ value: DailySchedule) throws {
         try store.saveDailySchedule(value)
         if session.activationState == .activated {
+            #if os(iOS)
+            guard session.isPaired, session.isWatchAppInstalled else { refresh(); return }
+            #elseif os(watchOS)
+            guard session.isCompanionAppInstalled else { refresh(); return }
+            #endif
             let context = try RecordingContextStore(root: store.root).settings()
             try session.updateApplicationContext(["dailyPlan":try JSONEncoder().encode(value),
                                                    "contextSettings":try JSONEncoder().encode(context)])
@@ -259,6 +270,12 @@ final class Connectivity: NSObject, ObservableObject, WCSessionDelegate {
         }
     }
     #if os(iOS)
+    func sessionWatchStateDidChange(_ session: WCSession) {
+        DispatchQueue.main.async {
+            do { try self.configureRoutine(try self.store.dailySchedule()) } catch { self.report(error) }
+            self.refresh()
+        }
+    }
     func sessionDidBecomeInactive(_ session: WCSession) {
         DispatchQueue.main.async { self.refresh() }
     }
