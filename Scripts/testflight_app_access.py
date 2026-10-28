@@ -8,8 +8,9 @@ The intended recipient stays in TF_INVITATION_EMAIL, never source or arguments.
 import argparse
 import json
 import os
+import re
 import sys
-from testflight_access import ASC, AccessError, attributes, find_app, find_build, identifier
+from testflight_access import ASC, APIError, AccessError, attributes, find_app, find_build, identifier
 from testflight_recipient import APP_ID, BUNDLE_ID, BUILD_NUMBER, MARKETING_VERSION, exact_email, target_address
 
 USER_ID = "6a1ea27a-16f4-4bc6-91db-db6ba3e9042e"
@@ -33,7 +34,11 @@ def current_scope(api, target):
 
 
 def single_app_access(api, target, apply=False):
-    before = current_scope(api, target)
+    try:
+        before = current_scope(api, target)
+    except APIError as error:
+        error.phase = "READ_BEFORE"
+        raise
     report = dict(app_id=APP_ID, user_id=USER_ID, existing_role="DEVELOPER", apply=apply,
                   app_visible=APP_ID in before, roles_changed=False, all_apps_enabled=False,
                   added_app_count=0, previous_app_count=len(before))
@@ -44,9 +49,17 @@ def single_app_access(api, target, apply=False):
         report["reason"] = "APP_ACCESS_ALREADY_PRESENT"
         return report
     # POST appends the one approved app; PATCH would replace the existing list.
-    api.request("POST", f"/v1/users/{USER_ID}/relationships/visibleApps",
-                body={"data": [{"type": "apps", "id": APP_ID}]})
-    after = current_scope(api, target)
+    try:
+        api.request("POST", f"/v1/users/{USER_ID}/relationships/visibleApps",
+                    body={"data": [{"type": "apps", "id": APP_ID}]})
+    except APIError as error:
+        error.phase = "APPEND_ONE_APP"
+        raise
+    try:
+        after = current_scope(api, target)
+    except APIError as error:
+        error.phase = "READ_AFTER"
+        raise
     if not before.issubset(after) or APP_ID not in after:
         raise AccessError("APP_ACCESS_WRITE_AWAITING_CONFIRMATION")
     if after - before != {APP_ID}:
@@ -63,8 +76,15 @@ def main(argv=None):
         report = single_app_access(ASC(), target_address(os.environ), args.apply)
         print(json.dumps(report, sort_keys=True), flush=True)
         return 0
-    except AccessError:
-        print('{"reason":"APP_ACCESS_CHECK_OR_WRITE_FAILED","app_id":"' + APP_ID + '"}', file=sys.stderr)
+    except APIError as error:
+        print(json.dumps({"reason": "APP_ACCESS_API_ERROR", "app_id": APP_ID,
+                          "phase": getattr(error, "phase", "PREFLIGHT"), "http_status": error.status,
+                          "api_error": str(error)}), file=sys.stderr)
+        return 2
+    except AccessError as error:
+        code = str(error)
+        print(json.dumps({"reason": code if re.fullmatch(r"[A-Z_]{1,80}", code)
+                          else "APP_ACCESS_CHECK_OR_WRITE_FAILED", "app_id": APP_ID}), file=sys.stderr)
         return 2
     except Exception:
         print('{"reason":"APP_ACCESS_OPERATION_FAILED"}', file=sys.stderr)
