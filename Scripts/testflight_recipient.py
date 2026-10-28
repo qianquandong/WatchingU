@@ -67,7 +67,7 @@ def inspect_recipient(api, target, build_number=BUILD_NUMBER, marketing=MARKETIN
             visible = all_apps is True
             if all_apps is False:
                 apps = api.listing(f"/v1/users/{uid}/relationships/visibleApps")
-                visible = len([a for a in apps if a.get("id") == APP_ID]) == 1
+                visible = len([a for a in apps if a.get("type") == "apps" and a.get("id") == APP_ID]) == 1
             report["app_visible"] = visible
             report["eligible"] = bool(ELIGIBLE_ROLES.intersection(roles)) and visible
             if not ELIGIBLE_ROLES.intersection(roles): reasons.append("TARGET_ROLE_NOT_ELIGIBLE")
@@ -75,8 +75,26 @@ def inspect_recipient(api, target, build_number=BUILD_NUMBER, marketing=MARKETIN
     except APIError as error:
         report.update(users_readable=False, users_api_status=error.status)
         reasons.append("TARGET_USERS_UNREADABLE")
-    people = api.listing("/v1/betaTesters", {"filter[email]": target, "fields[betaTesters]": "email,state", "limit": 200})
-    matched = [p for p in people if exact_email(p, "email", target)]
+    people = api.listing("/v1/betaTesters", {"filter[email]": target, "filter[apps]": APP_ID,
+        "fields[betaTesters]": "email,state", "limit": 200})
+    candidates = [p for p in people if exact_email(p, "email", target)]
+    report["target_tester_candidate_count"] = len(candidates)
+    report["tester_query_app_filtered"] = True
+    matched = []
+    tester_scope_readable = True
+    for candidate in candidates:
+        try:
+            apps = api.listing(f"/v1/betaTesters/{identifier(candidate['id'])}/relationships/apps")
+            associations = [a for a in apps if a.get("type") == "apps" and a.get("id") == APP_ID]
+            if len(associations) == 1: matched.append(candidate)
+            elif len(associations) > 1: reasons.append("TARGET_TESTER_APP_SCOPE_AMBIGUOUS")
+        except APIError as error:
+            tester_scope_readable = False
+            report["tester_scope_api_status"] = error.status
+    report["tester_app_scope_readable"] = tester_scope_readable
+    if not tester_scope_readable:
+        reasons.append("TARGET_TESTER_APP_SCOPE_UNREADABLE")
+        matched = []
     report["target_tester_count"] = len(matched)
     if len(matched) == 1:
         report.update(target_tester_id=identifier(matched[0]["id"]), target_tester_state=safe_state(attributes(matched[0]).get("state")))
@@ -90,7 +108,7 @@ def inspect_recipient(api, target, build_number=BUILD_NUMBER, marketing=MARKETIN
         reasons.append("BUILD_NOT_FOUND")
     else:
         bid = identifier(build["id"])
-        detail = api.request("GET", f"/v1/builds/{bid}", params={"fields[builds]": "version,processingState,buildAudienceType"}).get("data", {})
+        detail = api.request("GET", f"/v1/builds/{bid}", params={"fields[builds]": "version,processingState,buildAudienceType,expired"}).get("data", {})
         if detail.get("id") != bid or attributes(detail).get("version") != BUILD_NUMBER:
             raise AccessError("BUILD_SCOPE_MISMATCH")
         testing = api.request("GET", f"/v1/builds/{bid}/buildBetaDetail").get("data", {})
@@ -98,7 +116,10 @@ def inspect_recipient(api, target, build_number=BUILD_NUMBER, marketing=MARKETIN
             build_audience_type=safe_state(attributes(detail).get("buildAudienceType")),
             internal_build_state=safe_state(attributes(testing).get("internalBuildState")),
             external_build_state=safe_state(attributes(testing).get("externalBuildState")))
-        if attributes(build).get("expired") is True: reasons.append("BUILD_EXPIRED")
+        expired = attributes(detail).get("expired", attributes(build).get("expired"))
+        report["build_expired"] = expired if isinstance(expired, bool) else None
+        if expired is True: reasons.append("BUILD_EXPIRED")
+        elif expired is not False: reasons.append("BUILD_EXPIRY_UNKNOWN")
     if len(groups) != 1:
         reasons.append("TARGET_INTERNAL_GROUP_INVALID")
     else:
@@ -120,6 +141,82 @@ def inspect_recipient(api, target, build_number=BUILD_NUMBER, marketing=MARKETIN
     return report
 
 
+def invite_internal(api, target, build_number=BUILD_NUMBER, marketing=MARKETING_VERSION, group_id=GROUP_ID):
+    """Only add this existing eligible recipient and make at most one invitation request."""
+    actions = dict(mode="invite-internal", membership_added=False, invitation_attempted=False,
+                   invitation_request_accepted=None)
+    report = inspect_recipient(api, target, build_number, marketing, group_id)
+    report.update(actions)
+    if report["blocking_reasons"] or report.get("eligible") is not True:
+        return report
+    initial_state = report.get("target_tester_state")
+    if initial_state not in STATES or initial_state == "REVOKED":
+        report.update(ready=False, reason="TARGET_TESTER_REVOKED" if initial_state == "REVOKED" else "TARGET_TESTER_STATE_UNKNOWN")
+        return report
+    if report.get("build_expired") is not False or report.get("processing_state") != "VALID":
+        report.update(ready=False, reason="BUILD_NOT_PROCESSED")
+        return report
+    if not report.get("build_assigned"):
+        report.update(ready=False, reason="BUILD_NOT_ASSIGNED")
+        return report
+    if report.get("internal_build_state") != "IN_BETA_TESTING":
+        report.update(ready=False, reason="WAITING_FOR_INTERNAL_TESTING")
+        return report
+    tester_id = identifier(report["target_tester_id"])
+    if not report["target_group_member"]:
+        try:
+            api.request("POST", f"/v1/betaGroups/{GROUP_ID}/relationships/betaTesters",
+                body={"data": [{"type": "betaTesters", "id": tester_id}]})
+        except APIError as error:
+            report.update(ready=False, reason="TARGET_GROUP_ASSIGNMENT_FAILED", mutation_api_status=error.status)
+            return report
+        except AccessError:
+            report.update(ready=False, reason="TARGET_GROUP_ASSIGNMENT_UNCONFIRMED")
+            return report
+        actions["membership_added"] = True
+        report = inspect_recipient(api, target, build_number, marketing, group_id)
+        report.update(actions)
+        if report["blocking_reasons"] or report.get("eligible") is not True:
+            return report
+        if not report["target_group_member"] or report.get("target_tester_id") != tester_id:
+            report.update(ready=False, reason="TARGET_GROUP_ASSIGNMENT_WAITING")
+            return report
+        if (report.get("build_expired") is not False or report.get("processing_state") != "VALID"
+                or not report.get("build_assigned") or report.get("internal_build_state") != "IN_BETA_TESTING"):
+            report.update(ready=False, reason="INVITATION_PRECONDITION_CHANGED")
+            return report
+    # Do not resend a known invitation, including when membership propagation
+    # momentarily reports NOT_INVITED after the earlier global INVITED state.
+    if initial_state in {"INVITED", "ACCEPTED", "INSTALLED"}:
+        if initial_state == "INVITED": report.update(ready=False, reason="ACCEPT_EXISTING_INVITATION")
+        return report
+    state = report.get("target_tester_state")
+    if state != "NOT_INVITED":
+        return report
+    actions["invitation_attempted"] = True
+    report.update(actions)
+    try:
+        # ASC.request explicitly disables network/status retry for this endpoint.
+        api.request("POST", "/v1/betaTesterInvitations", body={"data": {
+            "type": "betaTesterInvitations", "relationships": {
+                "app": {"data": {"type": "apps", "id": APP_ID}},
+                "betaTester": {"data": {"type": "betaTesters", "id": tester_id}}
+            }}})
+    except APIError as error:
+        report.update(ready=False, reason="INVITATION_REQUEST_FAILED", mutation_api_status=error.status,
+                      invitation_request_accepted=False)
+        return report
+    except AccessError:
+        report.update(ready=False, reason="INVITATION_RESULT_UNCONFIRMED")
+        return report
+    actions["invitation_request_accepted"] = True
+    report = inspect_recipient(api, target, build_number, marketing, group_id)
+    report.update(actions)
+    if not report["blocking_reasons"] and report.get("target_tester_state") == "NOT_INVITED":
+        report.update(ready=False, reason="INVITATION_AWAITING_CONFIRMATION")
+    return report
+
+
 def readiness_reason(report):
     state = report.get("target_tester_state")
     if state not in STATES: return "TARGET_TESTER_STATE_UNKNOWN"
@@ -133,19 +230,24 @@ def readiness_reason(report):
     return "TARGET_INTERNAL_TESTING_AVAILABLE"
 
 
+class SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        # Unknown argv may itself be a pasted identity. Never echo it.
+        raise AccessError("RECIPIENT_ARGUMENTS_INVALID")
+
+
 def main(argv=None, env=os.environ, api_factory=ASC):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = SafeArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["inspect", "invite-internal"], default="inspect")
     parser.add_argument("--build-number", default=BUILD_NUMBER)
     parser.add_argument("--marketing-version", default=MARKETING_VERSION)
     parser.add_argument("--internal-group-id", default=GROUP_ID)
-    options = parser.parse_args(argv)
     try:
+        options = parser.parse_args(argv)
         target = target_address(env)
         api = api_factory()
-        report = inspect_recipient(api, target, options.build_number, options.marketing_version, options.internal_group_id)
-        if options.mode == "invite-internal":
-            report.update(mode="invite-internal", ready=False, reason="INVITATION_IMPLEMENTATION_PENDING")
+        operation = inspect_recipient if options.mode == "inspect" else invite_internal
+        report = operation(api, target, options.build_number, options.marketing_version, options.internal_group_id)
         print(json.dumps(report, ensure_ascii=True, sort_keys=True), flush=True)
         return 0 if options.mode == "inspect" or report["ready"] else 3
     except APIError as error:
