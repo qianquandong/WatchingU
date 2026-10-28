@@ -66,6 +66,76 @@ final class StorageTests: XCTestCase {
         // Delayed duplicate ACK is harmless.
         XCTAssertNoThrow(try store.acknowledge(Receipt(clip: clip)))
     }
+    func testExplicitDeletionDoesNotResurrectAfterLateRetransmission() throws {
+        let store = try ClipStore(root: root.appendingPathComponent("phone"))
+        let (inbox, clip) = try fixture(store); _ = try store.receive(inbox, clip: clip)
+        try store.deleteByUser(clip)
+        XCTAssertFalse(store.hasLocalAudio(clip.id)); XCTAssertTrue(try store.clips().isEmpty)
+        let reopened = try ClipStore(root: store.root)
+        XCTAssertTrue(try reopened.receive(inbox, clip: clip).matches(clip))
+        XCTAssertFalse(reopened.hasLocalAudio(clip.id)); XCTAssertTrue(try reopened.clips().isEmpty)
+        let (badInbox, badClip) = try fixture(store, id: clip.id, content: "conflicting retransmission")
+        XCTAssertThrowsError(try reopened.receive(badInbox, clip: badClip))
+    }
+    func testTombstoneHidesFilesLeftByInterruptedDeletionAndCleanupIsRetryable() throws {
+        let store = try ClipStore(root: root.appendingPathComponent("phone"))
+        let (inbox, clip) = try fixture(store); _ = try store.receive(inbox, clip: clip)
+        try store.commitCloudReceipt(cloud(clip), clip: clip, purge: false, uploadActive: false)
+        let tombstone = store.root.appendingPathComponent(clip.id.uuidString + ".deleted.json")
+        try JSONEncoder().encode(Receipt(clip: clip)).write(to: tombstone, options: .atomic)
+        // Reopen at the exact crash point: receipt is durable, all original files still exist.
+        let reopened = try ClipStore(root: store.root)
+        XCTAssertEqual(try reopened.deletedClipIDs(), Set([clip.id]))
+        XCTAssertTrue(try reopened.clips().isEmpty)
+        XCTAssertFalse(reopened.hasLocalAudio(clip.id))
+        XCTAssertFalse(reopened.retainAudio(clip.id))
+        XCTAssertNil(reopened.cloudReceipt(clip.id))
+        XCTAssertTrue(try reopened.pendingDeletedAudioIDs().contains(clip.id))
+        try reopened.purgeDeletedAudio()
+        XCTAssertTrue(try reopened.pendingDeletedAudioIDs().isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: reopened.audioURL(clip.id).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tombstone.path))
+        XCTAssertNoThrow(try reopened.purgeDeletedAudio())
+    }
+    func testDeletionFailureInvalidatesCachedLibraryRowBeforePhysicalCleanupFinishes() throws {
+        let store = try ClipStore(root: root.appendingPathComponent("phone"))
+        let (inbox, clip) = try fixture(store); _ = try store.receive(inbox, clip: clip)
+        XCTAssertEqual(try store.clips().count, 1) // Prime both live and deletion caches.
+        let blocker = store.root.appendingPathComponent(clip.id.uuidString + ".cloud.json")
+        try FileManager.default.createDirectory(at: blocker, withIntermediateDirectories: true)
+        XCTAssertThrowsError(try store.deleteByUser(clip))
+        XCTAssertTrue(try store.clips().isEmpty)
+        XCTAssertFalse(store.hasLocalAudio(clip.id))
+        XCTAssertFalse(store.retainAudio(clip.id))
+        XCTAssertTrue(try store.pendingDeletedAudioIDs().contains(clip.id))
+        try FileManager.default.removeItem(at: blocker)
+        try store.purgeDeletedAudio()
+        XCTAssertTrue(try store.pendingDeletedAudioIDs().isEmpty)
+        XCTAssertEqual(try ClipStore(root: store.root).deletedClipIDs(), Set([clip.id]))
+    }
+    func testMismatchedDeletedReceiptIsRejectedAndAudioAccessFailsClosed() throws {
+        let store = try ClipStore(root: root.appendingPathComponent("phone"))
+        let (inbox, clip) = try fixture(store); _ = try store.receive(inbox, clip: clip)
+        try JSONEncoder().encode(Receipt(clip: clip)).write(to:
+            store.root.appendingPathComponent(UUID().uuidString + ".deleted.json"))
+        let reopened = try ClipStore(root: store.root)
+        XCTAssertThrowsError(try reopened.deletedClipIDs())
+        XCTAssertThrowsError(try reopened.clips())
+        XCTAssertFalse(reopened.hasLocalAudio(clip.id))
+        XCTAssertFalse(reopened.retainAudio(clip.id))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: reopened.audioURL(clip.id).path))
+    }
+    func testPendingTranscriptionSurvivesVerifiedCloudCleanup() throws {
+        let store = try ClipStore(root: root.appendingPathComponent("phone"))
+        let (inbox, clip) = try fixture(store); _ = try store.receive(inbox, clip: clip)
+        let hold = store.root.appendingPathComponent(clip.id.uuidString + ".processing-hold")
+        try Data().write(to: hold)
+        try store.commitCloudReceipt(cloud(clip), clip: clip, purge: true, uploadActive: false)
+        XCTAssertTrue(store.hasLocalAudio(clip.id))
+        try FileManager.default.removeItem(at: hold)
+        try store.commitCloudReceipt(cloud(clip), clip: clip, purge: true, uploadActive: false)
+        XCTAssertFalse(store.hasLocalAudio(clip.id))
+    }
     private func cloud(_ clip: Clip, bytes: UInt64? = nil) -> CloudReceipt {
         CloudReceipt(clipID: clip.id, fileID: "audio", metadataFileID: "metadata", accountID: "account",
                      byteCount: bytes ?? clip.byteCount, sha256: clip.sha256, verifiedAt: Date())

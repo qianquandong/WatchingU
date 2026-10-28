@@ -1,8 +1,14 @@
-// Select your own Team for both targets. Never put a Google client secret here.
+// Select your own Team for all four targets. Never put a Google client secret here.
 DAYTAPE_BUNDLE_PREFIX = com.aimanjack.daytape
+DAYTAPE_APP_GROUP = group.$(DAYTAPE_BUNDLE_PREFIX)
 DEVELOPMENT_TEAM = GB24TMUMQ5
 GOOGLE_CLIENT_ID = configure.apps.googleusercontent.com
 GOOGLE_REVERSED_CLIENT_ID = com.googleusercontent.apps.configure
-// Fixed-time routine needs no HealthKit. Leave this flag empty.
-DAYTAPE_HEALTHKIT_FLAG =
-DAYTAPE_ENTITLEMENTS = Phone/NoHealth.entitlements
+// Reading health data remains opt-in inside the app.
+DAYTAPE_HEALTHKIT_FLAG = DAYTAPE_HEALTHKIT
+DAYTAPE_ENTITLEMENTS = Phone/DayTape.entitlements
+// Automatic signing leaves these empty; manual CI supplies one profile per target.
+DAYTAPE_PROFILE_IOS =
+DAYTAPE_PROFILE_WATCH =
+DAYTAPE_PROFILE_IOS_WIDGET =
+DAYTAPE_PROFILE_WATCH_WIDGET =

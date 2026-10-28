@@ -20,9 +20,21 @@ final class CaptureWriter {
                                              sampleRate: 16000, channels: 1, interleaved: false)!
     private var frames: AVAudioFramePosition = 0
     private var unreported: Double = 0
+    private var lastPosition: (clipID: UUID, clipOffset: Double)?
     let onSealed: (Clip) -> Void
     let onFailure: (Error) -> Void
     let onFrames: (Double) -> Void
+
+    /// A rare, user-initiated bookmark snapshots the last committed audio frame.
+    /// It never asks the realtime microphone callback to perform file/context work.
+    func positionSnapshot() -> (clipID: UUID, clipOffset: Double)? {
+        queue.sync {
+            if let draft = draft, frames > 0 {
+                return (draft.id, Double(max(0, frames - 1)) / 16000)
+            }
+            return lastPosition
+        }
+    }
 
     init(store: ClipStore, sessionID: UUID, deadline: Date? = nil, onDeadline: @escaping () -> Void = {}, onSealed: @escaping (Clip) -> Void,
          onFailure: @escaping (Error) -> Void, onFrames: @escaping (Double) -> Void) {
@@ -116,7 +128,11 @@ final class CaptureWriter {
         file = nil // finalizes the M4A container before hashing or transmitting it
         let duration = Double(frames) / 16000
         self.draft = nil; frames = 0
-        if duration > 0 { onSealed(try store.seal(draft, duration: duration)) }
+        if duration > 0 {
+            let clip = try store.seal(draft, duration: duration)
+            lastPosition = (clip.id, max(0, duration - 1.0 / 16000))
+            onSealed(clip)
+        }
     }
     func finish(_ completion: @escaping (Error?) -> Void) {
         backlogLock.lock(); accepting = false

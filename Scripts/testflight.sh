@@ -11,6 +11,7 @@ fail() { printf '%s\n' "TestFlight: $*" >&2; exit 1; }
 [[ -n "${RUNNER_TEMP:-}" ]] || fail 'RUNNER_TEMP is required.'
 export APPLE_SIGNING_STYLE="${APPLE_SIGNING_STYLE:-automatic}"
 export TF_BUILD_MODE="${TF_BUILD_MODE:-google-drive}"
+export DAYTAPE_APP_GROUP="${DAYTAPE_APP_GROUP:-group.${DAYTAPE_BUNDLE_PREFIX:-}}"
 case "$TF_BUILD_MODE" in
   google-drive) printf '%s\n' 'Build mode: Google Drive backup. A real Google iOS OAuth client is required.' ;;
   local-recording)
@@ -39,13 +40,15 @@ if style not in ('automatic', 'manual'):
     raise SystemExit('APPLE_SIGNING_STYLE must be automatic or manual.')
 if style == 'manual':
     required += ['APPLE_DISTRIBUTION_P12_BASE64', 'APPLE_DISTRIBUTION_P12_PASSWORD',
-                 'APPLE_PROVISION_PROFILE_IOS_BASE64', 'APPLE_PROVISION_PROFILE_WATCH_BASE64']
+                 'APPLE_PROVISION_PROFILE_IOS_BASE64', 'APPLE_PROVISION_PROFILE_WATCH_BASE64',
+                 'APPLE_PROVISION_PROFILE_IOS_WIDGET_BASE64', 'APPLE_PROVISION_PROFILE_WATCH_WIDGET_BASE64']
 missing = [name for name in required if not os.environ.get(name, '').strip()]
 if missing:
     raise SystemExit('Configure these GitHub Actions secrets/variables first: ' + ', '.join(missing))
 patterns = {
     'APPLE_TEAM_ID': r'[A-Z0-9]{10}',
     'DAYTAPE_BUNDLE_PREFIX': r'[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+){2,}',
+    'DAYTAPE_APP_GROUP': r'group\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+){1,}',
     'APP_STORE_CONNECT_API_KEY_ID': r'[A-Z0-9]{10}',
 }
 if os.environ['TF_BUILD_MODE'] == 'google-drive':
@@ -70,6 +73,42 @@ for name in required:
 print('Required configuration is present for build mode ' + os.environ['TF_BUILD_MODE'] + '.')
 PY
 
+# Reject missing or transparent store icons before the full build and upload.
+# Asset catalogs compile the same opaque 1024px source for both app platforms.
+python3 - <<'PY'
+import json
+import struct
+from pathlib import Path
+
+for folder, platform in [('Phone', 'ios'), ('Watch', 'watchos')]:
+    catalog = Path(folder) / 'Assets.xcassets/AppIcon.appiconset'
+    contents = json.loads((catalog / 'Contents.json').read_text(encoding='utf-8'))
+    entries = [entry for entry in contents.get('images', [])
+               if entry.get('idiom') == 'universal' and entry.get('platform') == platform
+               and entry.get('size') == '1024x1024']
+    if len(entries) != 1 or not entries[0].get('filename'):
+        raise SystemExit(folder + ' needs one named universal 1024x1024 AppIcon source.')
+    icon = (catalog / entries[0]['filename']).resolve()
+    if not icon.is_relative_to(catalog.resolve()) or not icon.is_file():
+        raise SystemExit(folder + ' AppIcon source is missing or outside its asset catalog.')
+    data = icon.read_bytes()
+    if len(data) < 33 or data[:8] != b'\x89PNG\r\n\x1a\n' or data[12:16] != b'IHDR':
+        raise SystemExit(folder + ' AppIcon must be a valid PNG.')
+    width, height, depth, color = struct.unpack('>IIBB', data[16:26])
+    if (width, height, depth, color) != (1024, 1024, 8, 2):
+        raise SystemExit(folder + ' AppIcon must be 1024x1024, 8-bit RGB with no alpha channel.')
+    offset = 8
+    while offset + 12 <= len(data):
+        length = struct.unpack('>I', data[offset:offset + 4])[0]
+        kind = data[offset + 4:offset + 8]
+        if kind == b'tRNS':
+            raise SystemExit(folder + ' AppIcon must not contain PNG transparency.')
+        offset += length + 12
+        if kind == b'IEND':
+            break
+    print(folder + ' AppIcon source is present, opaque RGB, and 1024x1024.')
+PY
+
 # Since April 28, 2026 Apple requires Xcode 26+ and current platform SDKs
 # for App Store Connect uploads. Deployment targets may remain iOS 17/Watch 10.
 python3 - <<'PY'
@@ -92,7 +131,8 @@ mkdir -p artifacts
 env -u APP_STORE_CONNECT_API_KEY_ID -u APP_STORE_CONNECT_API_ISSUER_ID \
   -u APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64 -u APPLE_DISTRIBUTION_P12_BASE64 \
   -u APPLE_DISTRIBUTION_P12_PASSWORD -u APPLE_PROVISION_PROFILE_IOS_BASE64 \
-  -u APPLE_PROVISION_PROFILE_WATCH_BASE64 bash Scripts/ci_build.sh
+  -u APPLE_PROVISION_PROFILE_WATCH_BASE64 -u APPLE_PROVISION_PROFILE_IOS_WIDGET_BASE64 \
+  -u APPLE_PROVISION_PROFILE_WATCH_WIDGET_BASE64 bash Scripts/ci_build.sh
 
 TF_PRIVATE_DIR="$(mktemp -d "${RUNNER_TEMP%/}/daytape-testflight.XXXXXX")"
 export TF_PRIVATE_DIR
@@ -130,7 +170,9 @@ files = {'APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64': 'AuthKey.p8'}
 if os.environ['APPLE_SIGNING_STYLE'] == 'manual':
     files.update(APPLE_DISTRIBUTION_P12_BASE64='distribution.p12',
                  APPLE_PROVISION_PROFILE_IOS_BASE64='iphone.mobileprovision',
-                 APPLE_PROVISION_PROFILE_WATCH_BASE64='watch.mobileprovision')
+                 APPLE_PROVISION_PROFILE_WATCH_BASE64='watch.mobileprovision',
+                 APPLE_PROVISION_PROFILE_IOS_WIDGET_BASE64='iphone-widget.mobileprovision',
+                 APPLE_PROVISION_PROFILE_WATCH_WIDGET_BASE64='watch-widget.mobileprovision')
 for name, filename in files.items():
     output = root / filename
     output.write_bytes(base64.b64decode(''.join(os.environ[name].split()), validate=True))
@@ -139,8 +181,9 @@ PY
 openssl pkey -in "$TF_PRIVATE_DIR/AuthKey.p8" -noout >/dev/null 2>&1 || fail 'The API private key could not be read.'
 
 if [[ "$APPLE_SIGNING_STYLE" == manual ]]; then
-  security cms -D -i "$TF_PRIVATE_DIR/iphone.mobileprovision" > "$TF_PRIVATE_DIR/iphone-profile.plist"
-  security cms -D -i "$TF_PRIVATE_DIR/watch.mobileprovision" > "$TF_PRIVATE_DIR/watch-profile.plist"
+  for profile_kind in iphone watch iphone-widget watch-widget; do
+    security cms -D -i "$TF_PRIVATE_DIR/${profile_kind}.mobileprovision" > "$TF_PRIVATE_DIR/${profile_kind}-profile.plist"
+  done
   python3 - <<'PY'
 import datetime
 import hashlib
@@ -156,7 +199,8 @@ bundle = os.environ['DAYTAPE_BUNDLE_PREFIX']
 now = datetime.datetime.now(datetime.timezone.utc)
 profiles = {}
 certificates = {}
-for kind, identifier in [('iphone', bundle), ('watch', bundle + '.watchkitapp')]:
+for kind, identifier in [('iphone', bundle), ('watch', bundle + '.watchkitapp'),
+                         ('iphone-widget', bundle + '.widgets'), ('watch-widget', bundle + '.watchkitapp.widgets')]:
     with (root / (kind + '-profile.plist')).open('rb') as stream:
         profile = plistlib.load(stream)
     entitlement = profile.get('Entitlements', {})
@@ -172,6 +216,10 @@ for kind, identifier in [('iphone', bundle), ('watch', bundle + '.watchkitapp')]
     if (profile.get('ProvisionedDevices') or profile.get('ProvisionsAllDevices')
             or entitlement.get('get-task-allow') or not entitlement.get('beta-reports-active')):
         raise SystemExit(kind + ' profile must be an App Store Connect distribution profile.')
+    if os.environ['DAYTAPE_APP_GROUP'] not in entitlement.get('com.apple.security.application-groups', []):
+        raise SystemExit(kind + ' profile must include the configured shared App Group.')
+    if kind == 'iphone' and not entitlement.get('com.apple.developer.healthkit'):
+        raise SystemExit('The iPhone provisioning profile must include HealthKit for opt-in health context.')
     try:
         profile_uuid = str(uuid.UUID(profile['UUID'])).upper()
     except (KeyError, ValueError):
@@ -194,7 +242,7 @@ with (root / 'profiles.plist').open('wb') as stream:
     plistlib.dump(profiles, stream)
 with (root / 'certificates.plist').open('wb') as stream:
     plistlib.dump(certificates, stream)
-print('Both App Store provisioning profiles match this app and team.')
+print('All four App Store provisioning profiles match the apps, widgets, shared group and team.')
 PY
   TF_KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
   printf '::add-mask::%s\n' "$TF_KEYCHAIN_PASSWORD"
@@ -218,9 +266,9 @@ with (root / 'certificates.plist').open('rb') as stream:
     certificates = plistlib.load(stream)
 identities = set(re.findall(r'([A-Fa-f0-9]{40})\s+"Apple Distribution:',
                             (root / 'identities.txt').read_text()))
-shared = set(certificates['iphone']) & set(certificates['watch'])
+shared = set.intersection(*(set(value) for value in certificates.values()))
 if not shared.intersection(identity.upper() for identity in identities):
-    raise SystemExit('The P12 needs a valid Apple Distribution identity with its private key, included in both profiles.')
+    raise SystemExit('The P12 needs a valid Apple Distribution identity with its private key, included in all four profiles.')
 PY
 fi
 
@@ -234,11 +282,12 @@ style = os.environ['APPLE_SIGNING_STYLE']
 client = os.environ['GOOGLE_CLIENT_ID']
 lines = [
     'DAYTAPE_BUNDLE_PREFIX = ' + os.environ['DAYTAPE_BUNDLE_PREFIX'],
+    'DAYTAPE_APP_GROUP = ' + os.environ['DAYTAPE_APP_GROUP'],
     'DEVELOPMENT_TEAM = ' + os.environ['APPLE_TEAM_ID'],
     'GOOGLE_CLIENT_ID = ' + client,
     'GOOGLE_REVERSED_CLIENT_ID = ' + '.'.join(reversed(client.split('.'))),
-    'DAYTAPE_HEALTHKIT_FLAG =',
-    'DAYTAPE_ENTITLEMENTS = Phone/NoHealth.entitlements',
+    'DAYTAPE_HEALTHKIT_FLAG = DAYTAPE_HEALTHKIT',
+    'DAYTAPE_ENTITLEMENTS = Phone/DayTape.entitlements',
     'CODE_SIGN_STYLE = ' + style.capitalize(),
 ]
 options = dict(method='app-store-connect', signingStyle=style,
@@ -248,12 +297,15 @@ if style == 'manual':
     with (root / 'profiles.plist').open('rb') as stream:
         profiles = plistlib.load(stream)
     lines += ['CODE_SIGN_IDENTITY = Apple Distribution',
-              'PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*] = ' + profiles['iphone'],
-              'PROVISIONING_PROFILE_SPECIFIER[sdk=watchos*] = ' + profiles['watch']]
+              'DAYTAPE_PROFILE_IOS = ' + profiles['iphone'],
+              'DAYTAPE_PROFILE_WATCH = ' + profiles['watch'],
+              'DAYTAPE_PROFILE_IOS_WIDGET = ' + profiles['iphone-widget'],
+              'DAYTAPE_PROFILE_WATCH_WIDGET = ' + profiles['watch-widget']]
     bundle = os.environ['DAYTAPE_BUNDLE_PREFIX']
     options['signingCertificate'] = 'Apple Distribution'
-    options['provisioningProfiles'] = {bundle: profiles['iphone'], bundle + '.watchkitapp': profiles['watch']}
-(root / 'Signing.xcconfig').write_text('\n'.join(lines) + '\n')
+    options['provisioningProfiles'] = {bundle: profiles['iphone'], bundle + '.watchkitapp': profiles['watch'],
+        bundle + '.widgets': profiles['iphone-widget'], bundle + '.watchkitapp.widgets': profiles['watch-widget']}
+(root / 'Signing.xcconfig').write_text('\n'.join(lines) + '\n', encoding='utf-8')
 for destination in ['export', 'upload']:
     with (root / (destination + '.plist')).open('wb') as stream:
         plistlib.dump(dict(options, destination=destination), stream)
@@ -274,6 +326,7 @@ text = (Path(os.environ['TF_PRIVATE_DIR']) / (label + '.log')).read_text(errors=
 for name in ['APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64', 'APPLE_DISTRIBUTION_P12_BASE64',
              'APPLE_DISTRIBUTION_P12_PASSWORD', 'APPLE_PROVISION_PROFILE_IOS_BASE64',
              'APPLE_PROVISION_PROFILE_WATCH_BASE64', 'APP_STORE_CONNECT_API_KEY_ID',
+             'APPLE_PROVISION_PROFILE_IOS_WIDGET_BASE64', 'APPLE_PROVISION_PROFILE_WATCH_WIDGET_BASE64',
              'APP_STORE_CONNECT_API_ISSUER_ID']:
     value = os.environ.get(name, '')
     if value:
@@ -335,19 +388,39 @@ with zipfile.ZipFile(packages[0]) as package:
     if len(watches) != 1:
         raise SystemExit('The IPA must contain the companion Watch application.')
     watch = plistlib.loads(package.read(watches[0]))
+    widget_infos = []
+    for label, parent in [('iPhone widget', phones[0]), ('Watch widget', watches[0])]:
+        prefix = parent[:-len('Info.plist')] + 'PlugIns/'
+        matches = [name for name in names if name.startswith(prefix) and
+                   name.count('/') == prefix.count('/') + 1 and name.endswith('.appex/Info.plist')]
+        if len(matches) != 1:
+            raise SystemExit('The IPA must embed exactly one ' + label + ' extension.')
+        widget_infos.append(plistlib.loads(package.read(matches[0])))
 bundle = os.environ['DAYTAPE_BUNDLE_PREFIX']
 if phone.get('CFBundleIdentifier') != bundle or watch.get('CFBundleIdentifier') != bundle + '.watchkitapp':
     raise SystemExit('The exported bundle identifiers do not match the signing configuration.')
 if watch.get('WKCompanionAppBundleIdentifier') != bundle:
     raise SystemExit('The Watch companion bundle identifier is incorrect.')
-for info in [phone, watch]:
+for info, suffix in [(phone, ''), (watch, '.watchkitapp'),
+                     (widget_infos[0], '.widgets'), (widget_infos[1], '.watchkitapp.widgets')]:
+    if info.get('CFBundleIdentifier') != bundle + suffix:
+        raise SystemExit('An exported app/widget bundle identifier does not match its signing configuration.')
     if info.get('CFBundleVersion') != os.environ['TF_BUILD_NUMBER']:
-        raise SystemExit('The iPhone and Watch build numbers must match this workflow run.')
+        raise SystemExit('All four app/widget build numbers must match this workflow run.')
+    if info.get('CFBundleShortVersionString') != '0.5.0':
+        raise SystemExit('All four app/widget versions must be 0.5.0.')
+    if info.get('DayTapeAppGroup') != os.environ['DAYTAPE_APP_GROUP']:
+        raise SystemExit('An exported app/widget is missing the configured shared App Group.')
+for info in widget_infos:
+    if info.get('NSExtension', {}).get('NSExtensionPointIdentifier') != 'com.apple.widgetkit-extension':
+        raise SystemExit('An embedded extension is not a WidgetKit extension.')
 if phone.get('GIDClientID') != os.environ['GOOGLE_CLIENT_ID']:
     raise SystemExit('The exported client configuration does not match the selected build mode.')
 schemes = [s for entry in phone.get('CFBundleURLTypes', []) for s in entry.get('CFBundleURLSchemes', [])]
 if '.'.join(reversed(os.environ['GOOGLE_CLIENT_ID'].split('.'))) not in schemes:
     raise SystemExit('The Google OAuth callback URL scheme is missing.')
+if 'daytape' not in schemes:
+    raise SystemExit('The DayTape app URL scheme is missing.')
 
 def checked(command, label):
     result = subprocess.run(command, capture_output=True)
@@ -366,10 +439,16 @@ if len(apps) != 1:
 watch_apps = list((apps[0] / 'Watch').glob('*.app'))
 if len(watch_apps) != 1:
     raise SystemExit('The expanded iPhone app must embed one Watch app.')
+phone_widgets = list((apps[0] / 'PlugIns').glob('*.appex'))
+watch_widgets = list((watch_apps[0] / 'PlugIns').glob('*.appex'))
+if len(phone_widgets) != 1 or len(watch_widgets) != 1:
+    raise SystemExit('The expanded IPA must embed one iPhone widget and one Watch widget.')
 team = os.environ['APPLE_TEAM_ID']
 now = datetime.datetime.now(datetime.timezone.utc)
 for label, app, identifier in [('iPhone', apps[0], bundle),
-                               ('Watch', watch_apps[0], bundle + '.watchkitapp')]:
+                               ('Watch', watch_apps[0], bundle + '.watchkitapp'),
+                               ('iPhone widget', phone_widgets[0], bundle + '.widgets'),
+                               ('Watch widget', watch_widgets[0], bundle + '.watchkitapp.widgets')]:
     checked(['codesign', '--verify', '--deep', '--strict', str(app)], label + ' code signature verification')
     try:
         signature = plistlib.loads(checked(
@@ -384,6 +463,13 @@ for label, app, identifier in [('iPhone', apps[0], bundle),
             or team not in profile.get('TeamIdentifier', [])):
         raise SystemExit(label + ' was not signed for the configured Apple team.')
     profile_entitlements = profile.get('Entitlements', {})
+    group = os.environ['DAYTAPE_APP_GROUP']
+    if (group not in signature.get('com.apple.security.application-groups', []) or
+            group not in profile_entitlements.get('com.apple.security.application-groups', [])):
+        raise SystemExit(label + ' signed entitlements/profile do not allow the shared App Group.')
+    if label == 'iPhone' and (not signature.get('com.apple.developer.healthkit') or
+                              not profile_entitlements.get('com.apple.developer.healthkit')):
+        raise SystemExit('The iPhone signature/profile must support opt-in HealthKit.')
     app_id = signature.get('application-identifier')
     prefixes = profile.get('ApplicationIdentifierPrefix', [])
     if (not any(app_id == prefix + '.' + identifier for prefix in prefixes)
@@ -396,7 +482,7 @@ for label, app, identifier in [('iPhone', apps[0], bundle),
             or 'ProvisionedDevices' in profile or profile.get('ProvisionsAllDevices')
             or not profile_entitlements.get('beta-reports-active')):
         raise SystemExit(label + ' must have App Store distribution signing, without development/debugger access.')
-print('Verified both App Store distribution signatures, teams, application identifiers and embedded profiles for '
+print('Verified all four App Store distribution signatures, teams, groups, application identifiers and embedded profiles for '
       + os.environ['TF_BUILD_MODE'] + '.')
 PY
 

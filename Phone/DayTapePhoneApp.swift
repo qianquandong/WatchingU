@@ -2,6 +2,7 @@ import SwiftUI
 import AVFoundation
 import GoogleSignIn
 import UIKit
+import WidgetKit
 
 @MainActor
 final class PhoneServices: ObservableObject {
@@ -9,14 +10,43 @@ final class PhoneServices: ObservableObject {
     let archive: NightArchiveController?
     let store: ClipStore?
     let transport: Connectivity?
+    let intelligence: IntelligenceController?
+    let context: PhoneContextService?
+    let voice: VoiceIdentityService?
+    let desktop: DesktopBridge?
     let startupError: String?
+    private var foregroundActive = false
+    private var backgroundOpportunity = false
     init() {
         do {
             let local = try ClipStore()
             let cloud = try NightArchiveController(store: local)
-            store = local; transport = Connectivity(store: local)
-            archive = cloud; startupError = nil
-        } catch { store = nil; transport = nil; archive = nil; startupError = error.localizedDescription }
+            let link = Connectivity(store: local)
+            let words = IntelligenceController(store: local)
+            let optionalContext = try PhoneContextService(store: local, connectivity: link)
+            store = local; transport = link; archive = cloud
+            intelligence = words; context = optionalContext
+            voice = VoiceIdentityService(store: local)
+            desktop = DesktopBridge(store: local, intelligence: words)
+            startupError = nil
+            cloud.onProcessingOpportunity = { [weak self] granted in
+                guard let self = self else { return }
+                self.backgroundOpportunity = granted; self.updateExecutionOpportunity()
+            }
+            cloud.processDuringBackgroundOpportunity = { [weak words] in await words?.processDuringGrantedOpportunity() }
+        } catch {
+            store = nil; transport = nil; archive = nil; intelligence = nil; context = nil; voice = nil; desktop = nil
+            startupError = error.localizedDescription
+        }
+    }
+    func setForegroundActive(_ active: Bool) {
+        foregroundActive = active
+        if !active { voice?.pause(); desktop?.stop() }
+        updateExecutionOpportunity()
+    }
+    private func updateExecutionOpportunity() {
+        intelligence?.setExecutionOpportunity(foregroundActive || backgroundOpportunity)
+        if foregroundActive || backgroundOpportunity { Task { await intelligence?.automaticWorkIfAllowed() } }
     }
 }
 
@@ -38,8 +68,11 @@ struct DayTapePhoneApp: App {
     @StateObject private var services = PhoneServices.shared
     var body: some Scene {
         WindowGroup {
-            if let store = services.store, let transport = services.transport, let archive = services.archive {
-                PhoneHome(store: store, transport: transport, archive: archive).preferredColorScheme(.dark)
+            if let store = services.store, let transport = services.transport, let archive = services.archive,
+               let intelligence = services.intelligence, let context = services.context,
+               let voice = services.voice, let desktop = services.desktop {
+                DayTapeRootView(services: services, store: store, transport: transport, archive: archive,
+                    intelligence: intelligence, context: context, voice: voice, desktop: desktop).preferredColorScheme(.dark)
                     .onOpenURL { _ = GIDSignIn.sharedInstance.handle($0) }
             } else {
                 ContentUnavailableView("无法打开存储", systemImage: "externaldrive.badge.exclamationmark",
@@ -57,6 +90,9 @@ final class Playback: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private var pinnedID: UUID?
     func toggle(_ clip: Clip, store: ClipStore) {
         if playingID == clip.id { stop(); return }
+        play(clip, store: store, offset: 0)
+    }
+    func play(_ clip: Clip, store: ClipStore, offset: Double = 0) {
         do {
             stop()
             guard store.retainAudio(clip.id) else { throw ArchiveError.encoding }
@@ -65,7 +101,9 @@ final class Playback: NSObject, ObservableObject, AVAudioPlayerDelegate {
             try AVAudioSession.sharedInstance().setActive(true)
             let next = try AVAudioPlayer(contentsOf: store.audioURL(clip.id))
             next.delegate = self
-            guard next.prepareToPlay(), next.play() else { throw ArchiveError.encoding }
+            guard next.prepareToPlay() else { throw ArchiveError.encoding }
+            next.currentTime = max(0, min(offset.isFinite ? offset : 0, max(0, next.duration - 0.01)))
+            guard next.play() else { throw ArchiveError.encoding }
             player = next; playingID = clip.id; errorText = nil
         } catch { stop(); errorText = error.localizedDescription }
     }

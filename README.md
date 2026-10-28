@@ -1,113 +1,71 @@
-# WatchingU · DayTape v0.4.1
+# WatchingU · DayTape 0.5
 
-独立编写的原生 Apple Watch + iPhone 源码原型。没有使用 Auday 的安装包、反编译代码或素材。
+原生 Apple Watch + iPhone 录音与个人档案应用。手表持续采集，手机负责转写、检索、回顾与备份。独立编写，没有使用 Auday 的安装包、反编译代码或素材。
 
-**状态：GitHub macOS CI 已通过 iPhone／Watch 模拟器编译、35 项 Swift 测试与 40,045 条 C 断言。待 TestFlight 签名上传和配对真机验收；尚未连接真实 Google Drive，也未验证全天续航或后台上传。**
+**这是功能扩展分支，尚未完成签名安装与配对真机验收。** 编译和规则测试不能证明真实 14 小时续航、后台任务准时运行或识别准确率。功能明细见 [docs/FEATURES_0.5.md](docs/FEATURES_0.5.md)，验证记录见 [VALIDATION.md](VALIDATION.md)。
 
-## 已按用户选择配置的流程
+## 功能
 
-时间固定为 **America/Chicago（达拉斯，自动跟随夏令时）**，不会随旅行时设备时区自动改变。
+- Watch 连续分段录音、音频帧位置的重要时刻标记、中断提示、前台恢复、快捷指令和表盘组件。
+- 约 15 分钟的有界批次同步；低电量延后自动传输，手动例外只限本批。手机持久保存并核验后才确认，未确认音频保留在手表。
+- iPhone 本机多语言转写、50 秒检查点、暂停续接、任务状态、文字编辑、关键词/本机语义搜索，以及文字定位原声。设备缺少本机模型时明确报错，不静默回退云端。
+- 可选云端/自建转写：独立密钥、明确的原声分享开关、实际接收地址与检查点。默认使用本机；变更接收地址后须重新开启分享。自动远程转写只在充电且获得运行机会时进行。
+- 用户配置的兼容 AI 服务：有原文引用的高光、决策与行动项、每日总结、反思和历史问答。个人记忆可编辑、停用、删除；AI 建议的记忆默认不启用。
+- 长日回顾全量分块、递归合并与持久缓存；显示原文块进度和未完成转写的覆盖缺口，中断后只补未完成块。
+- 可选本机说话人区分、三段本人声纹采集与可修正的声音标签。FluidAudio 0.12.4 / Core ML 模型由用户首次准备时下载，不上传录音到模型下载站点。
+- 默认关闭的大致地点，以及录音对应时间范围内的心率、HRV SDNN、步数、活动能量与睡眠关联；不把指标当作情绪或医学诊断。
+- 按日期/小时批量导出本机原声、TXT/JSON 转写、重要标记、关联与 Markdown/JSON 回顾。跨范围或来源不明的 AI 结果不进入范围导出；已仅存在云端的原声明确列为未包含。
+- iPhone 锁屏/主屏小组件、Watch 表盘组件，显示最近保存的状态。系统决定刷新频率，不声称实时读数。
+- 按用户选择日期范围的本地加密电脑只读接口与 MCP 客户端；原声读取默认关闭，离开接入页或退后台即撤销本次连接。
+- Google Drive 原声与片段元数据的充电自动备份、单次手动备份、超过 24 小时积压提醒、稳定远端 ID、双文件校验和完整日清理保护。转写和回顾另可通过 ZIP 导出。
+- 待转写和正在播放/识别/导出的音频不会自动清理。用户可明确删除本机录音与相关文字；云盘副本保留，迟到重传不会恢复已删除内容。
 
-| 时间/事件 | 行为 |
-|---|---|
-| 每天 08:00 | 手表显示例行提醒；点“开始录音”打开 App，在前台自动执行开始 |
-| 08:00–22:00 | 连续录音，约每分钟封存一段；白天以本地保存为主 |
-| 22:00 | 正常运行的录音会话自动停止，封存最后片段并通知用户，尝试夜间同步 |
-| 夜间 | 手表向 iPhone 批量传文件；iPhone 在用户选定时间，仅 Wi-Fi 尝试归档到 Google Drive |
-| 当天清单全部归档 | 手机通知完成，保留最近一个完整归档日的本地音频；清理更早且云端可验证的副本 |
-| 失败/不完整 | 保留本地音频和任务，等待后续机会补传；不会为了凑“只留一天”而删除未备份内容 |
+## 录音与备份
 
-这里的“留一天”指手机本地保留最近一个完整归档日。录今天的时候，手机可能同时保留昨天；今天未传齐时仍保留昨天。没有录音的日期不会让最近一份完整本地副本自动过期。**Drive 里的历史录音不会删除。**手表在手机确认持久保存对应片段后释放该片段，与手机保留策略分开。
+固定 America/Chicago 日程：08:00 提醒，用户点通知或开始按钮后才在前台启动麦克风，正常运行的录音会话到 22:00 停止。系统中断可能形成缺口；应用显示中断，不假装已补录。
 
-首次使用需在手表点击“启用每日提醒”，允许通知和麦克风；手机打开“录音与备份”里的“自动备份”，连接 Google、选择上传时间，再点“完成并开启”。这些是装机时的一次性授权，源码本身不会在聊天里替你安装或授予权限。首次麦克风系统弹窗可能需要额外点击。
+Watch 到手机与手机到 Drive 是独立两步。手表按批次同步，不必等手表充电。手机云端自动请求需要已知充电/接电满电、符合 Wi-Fi 选项、有前台或 BGProcessing 运行机会。拔电或运行时间到期会取消自动工作并保留文件。已发出的在途字节无法收回。
 
-## 面向普通用户的设置
+“立即备份”只对点击时的批次绕过充电条件，仍遵守网络选项。忘记充电会保留本地文件、安排超过 24 小时通知，等下次符合条件时补传；通知受系统权限和 Focus 影响。真实 OAuth/Drive 和配对交付仍需验收。
 
-1. **关闭自动备份**：只本地保存，不要求 Google 登录。已经连接过账户时可保留连接，或单独断开。
-2. **开启自动备份**：进入连接及时间选择，不添加解释文案。
-3. **连接账户**：使用官方 Google 登录按钮选择账户并授权；连接本身不会启动上传。
-4. **选择时间**：22:00（默认）、23:00、自定义夜间时间。录音停止时间仍为22:00；允许的备份时间为22:00到次日08:00之前。
-5. **保留选项**：默认仅Wi-Fi、手机留最近一天；也可选择全部本地保留。Drive历史文件继续保留。
-6. **完成并开启**：全部配置持久保存成功才启用上传。取消、登录取消、未授权、无效时间、保存失败时保留之前设置，不显示虚假开启状态。
+## 在 Mac 构建
 
-OAuth客户端、URL scheme、Drive API和发布配置是**开发者在应用上线前统一完成的工作**。普通用户不需要创建Google Cloud项目、申请API或填写Client ID。发布前需按Google当前要求处理应用品牌/同意页面及适用审核，不能把测试项目的未验证警告当作正式体验。
+1. 克隆仓库，打开 DayTape.xcodeproj。使用支持 Swift 6 依赖的 Xcode；CI 使用 Xcode 26 系列，部署目标为 iOS 17 / watchOS 10。
+2. 在 Local.xcconfig 设置唯一 DAYTAPE_BUNDLE_PREFIX 与 Team。四个 target 使用同一个 App Group；Phone 配置 HealthKit entitlement，默认关闭健康读取。
+3. Xcode 解析固定 GoogleSignIn 10.0.0、FluidAudio 0.12.4。先安装 iPhone，再安装配对 Watch；按明确操作授权麦克风、通知和可选位置。
+4. 手机选择本机转写语言。远程功能需自己的服务商、模型和密钥；费用由该服务商收取。本机录音/转写/搜索/回放不要求启用远程 AI。
+5. Drive 开发配置见 [CLOUD_SETUP.md](CLOUD_SETUP.md)，发布签名及四个 profile 见 [TESTFLIGHT_SETUP.md](TESTFLIGHT_SETUP.md)。普通用户只需登录授权，不应自己申请 OAuth 客户端。
+6. 按 [ACCEPTANCE.md](ACCEPTANCE.md)、[docs/REVIEW_FINDINGS.md](docs/REVIEW_FINDINGS.md) 完成脱离调试器的设备回归。
 
-界面只保留选项、操作、实际状态和必要错误提示；不添加介绍段落、帮助折叠项或说明脚注。后台队列、哈希、OAuth术语不出现在普通设置流程。未配置开发客户端时，产品显示“云端备份暂不可用，可以继续本地录音”；开发人员按CLOUD_SETUP.md排查。
-
-## 录音与传输
-
-- AVAudioEngine 持续采集，后台串行转换和 AAC 编码，不在分钟分段边界重开麦克风。
-- 候选参数为 16 kHz 单声道 / AAC 24 kbps；理论编码载荷约 10.8 MB/小时、14 小时约 151 MB，实际容器大小、质量和耗电需真机测量。
-- 默认没有转写、AI 总结、GPS、实时波形或额外睡眠检测。HealthKit 默认不编译、不请求权限。
-- 白天自动入口遵守夜间窗口，不因激活、网络变化或回执而绕过。手动“立即同步”和“立即归档”是明确的例外。
-- 界面录音进度约两秒报告一次，状态检查约十秒一次；不再在录音状态检查中扫描全部待传文件。
-- 录音索引在内存中缓存；每段只新增一个小型持久账目，不在每分钟重写整天的清单。夜间才汇总完整清单。
-- Watch 到手机最多三个文件在途；Drive 最多两个传输项在途。回执与重试任务持久保存。
-- 手机复制系统临时收件文件、核对 SHA-256/字节数并持久保存后才确认；手表只在匹配确认后清理。
-
-## 为什么旧录音不会提前清理
-
-1. 手表把每段 ID、时间、大小和 SHA-256 另存一份账目；即使片段已经被手机确认，账目也保留。
-2. 截止时间到达、编码器收尾结束，且没有未解决录音草稿，才生成当天封闭清单。清单通过文件传输，避免消息大小限制。
-3. 手机收到清单后，要求实际索引与清单逐段匹配；每段音频及对应 JSON 都要有同一 Google 账户的云端校验回执。
-4. 当天缺一段、缺回执、账户不符、清单冲突或出现清单外片段，都不会将该日当作完整归档日。
-5. 只有更早日期的候选音频才可清理；清理前再次读取 Drive 的服务端 ID、非垃圾箱状态、大小、SHA-256。先持久保存回执，再删除本地音频。
-6. 正在播放/导出的文件有引用保护；手机保留时间线、小型清单及云盘链接。
-
-完整清单描述的是已持久保存的录音段，不表示现实中的声音零缺口。系统中断期间未采集到的声音无法补回。
-
-## GitHub 与 CI
-
-仓库：[qianquandong/WatchingU](https://github.com/qianquandong/WatchingU)。每次推送 main 或创建 PR，Native CI 会在 macOS 上运行 C 断言、35 个 Swift 存储与日期测试，以及 iPhone / Watch 模拟器无签名编译。编译日志和 xcresult 保存在对应 Actions 运行的 artifacts 中。CI 通过仅证明这些测试与编译通过，配对真机、后台调度与续航仍需 TestFlight 验收。
-
-TestFlight 签名、GitHub Secrets 与上传步骤见 [TESTFLIGHT_SETUP.md](TESTFLIGHT_SETUP.md)。
-
-## 在 Mac 安装
-
-1. 克隆本仓库，双击 DayTape.xcodeproj。无需 XcodeGen；Xcode 会用 Swift Package Manager 解析固定 GoogleSignIn 10.0.0 及依赖，需要联网。
-2. 使用支持你的 iPhone / Watch 系统及 SDK 依赖的 Xcode。部署目标 iOS 17、watchOS 10。Intel Mac 能否使用取决于具体型号、macOS 和可安装的 Xcode。
-3. 修改 Local.xcconfig 的 DAYTAPE_BUNDLE_PREFIX 为你自己的唯一 Bundle 前缀。在两个 target 的 Signing & Capabilities 选同一 Team，自动签名。
-4. 按 CLOUD_SETUP.md 创建 Google iOS OAuth 客户端，填入客户端 ID 和反向 URL scheme。无需在 App 内保存 client secret，不需要自建服务器。
-5. 连接配对的 iPhone 和 Watch，按 Xcode 提示开启 Developer Mode。先用 DayTape scheme 安装手机，再用 DayTapeWatch scheme 安装手表。
-6. 同时打开两端。在手表启用每日提醒、允许麦克风；在手机打开自动备份，按引导连接 Drive 和选择时间。未完成配置前只本地录音，不会冒充云端已连接。
-7. 在 08:00–22:00 内先录两三分钟，停止后手动“立即同步”，再在手机手动“立即归档”。确认 Drive 文件可播放及 JSON 正确，然后做真实过夜测试。
-
-当前默认没有 HealthKit 签名能力要求。基础自用调试可先尝试 Xcode Personal Team，实际签名、设备与期限以 Xcode 提示为准；本工程不代为购买或注册开发者服务。
+python3 Scripts/generate_project.py 可以确定性重建四 target 工程、Info.plist、entitlements 与 schemes；先保留任何手工 Xcode 改动。
 
 ## 检查
 
-在 Mac 进入项目目录执行：
-
 ```sh
-sh Scripts/check_mac.sh
+bash Scripts/ci_build.sh
+python3 -m venv .build/client-venv
+.build/client-venv/bin/python -m pip install -r Tools/requirements.txt
+.build/client-venv/bin/python -m unittest discover -s Tools -p 'test_*.py' -v
 ```
 
-脚本执行 C 可靠性断言、35 个 Swift 文件存储/日期/清单测试，以及 iOS 和 Watch 模拟器无签名编译。模拟器无法验证真实配对交付、锁屏定时或全天耗电。详见 ACCEPTANCE.md 与 VALIDATION.md。
+CI 检查 C 规则、Swift 持久化/日期/清单/上下文/加密/ZIP/AI 分块，编译 iPhone、Watch 和各自小组件，并启动 iPhone 模拟器保存真实首页截图。测试不调用付费 AI、不上传真实用户录音，不把假文字当作转写实测。
 
-`python3 Scripts/generate_project.py` 会重建工程、Info.plist 和 scheme；若在 Xcode 修改过这些文件，重建前备份。
+## 电脑接入
 
-## 系统限制
+手机设置 → 电脑只读接入，选择日期并开启。手机与电脑用同一 Wi-Fi；把手机复制的连接 JSON 保存为本地私密文件，不放进 Git。
 
-- 通知显示受通知权限、专注模式、设备状态影响。通知请求创建成功不代表提醒一定被看到。
-- 麦克风不会在 08:00 悄悄后台启动；需要用户点通知或 App 开始按钮，且启动时 App 在前台。
-- 22:00 用录音会话内的定时器及音频写入截止检查停止。若进程已终止/系统抢占麦克风，不能保证继续录、准时通知或自动恢复。重新打开会检查状态，保留可恢复文件。
-- Watch 夜间刷新及 iPhone BGProcessing 是系统安排的机会，不是精确闹钟；已排队的系统传输可能延迟到白天。无法承诺当晚一定传完。
-- 夜间批传把白天的备份延后，手表上有单份录音的时间更长。设备丢失/损坏会造成尚未传出的录音丢失。
-- 达到约 1 GiB 待传缓存或不足约 100 MiB 余量时停止新录音，保留已有文件；不会自动抹掉未备份片段。
-- Google 授权失效、配额不足、无网络、清单冲突时保留文件。云端手工删除唯一副本后，本机已清理的音频无法恢复。
-- Drive 文件为普通可播放音频，通过 HTTPS 传输，尚未实现独立端到端加密；App 内暂不自动下载云端音频，时间线可打开 Drive。
-- 本版没有实际证明“最低耗电”或14小时续航。请先完成真机测量，不要把源码状态当作成品可用状态。
+```sh
+python3 Tools/daytape_bridge.py --pairing pairing.json status
+python3 Tools/daytape_bridge.py --pairing pairing.json search --query "会议"
+python3 Tools/daytape_bridge.py --pairing pairing.json --stdio
+```
 
-## 文件
+最后一条可作为通用 MCP 客户端的 stdio 命令。工具只有搜索、读某日转写、读已保存回顾/记忆与可选原声，不提供修改、删除或生成付费请求。AES-GCM 密钥每次开启重新随机生成；校验重放、时间戳、长度和完整输入来源范围。关闭接入即撤销本次密钥。
 
-- Watch/WatchRecorder.swift：授权、用户开始、固定截止、系统中断。
-- Watch/CaptureWriter.swift：连续采集缓冲、转换、分段、写入截止。
-- Shared/DailySchedule.swift：达拉斯时间、夏令时和保留一天规则。
-- Shared/DailyNotifications.swift：晨间通知及前台开始动作。
-- Shared/DayArchive.swift：独立录音账目、当天清单、完整性判断。
-- Shared/ClipStore.swift：持久保存、哈希、回执、引用保护、恢复。
-- Shared/Connectivity.swift：配对同步、日清单确认、夜间门控。
-- Phone/NightArchiveController.swift：Drive 队列、双文件校验、完成通知与日期清理。
-- Phone/BackupSetupView.swift：连接、时间、保留选项的设置引导。
-- Shared/BackupClock.swift：上传时间与录音停止时间分离，支持跨午夜与夏令时。
-- CLOUD_SETUP.md：一次性云盘配置；ACCEPTANCE.md：真机验收；VALIDATION.md：实际检查范围。
+## 实际边界
+
+本机语音/语义模型的可用语言由设备和系统决定，不保证与 Auday 的语言和准确率相同。声音识别是估计，可手动修正。远程 AI 与健康/位置关联均为可选；缺少配置、授权或证据时显示真实状态，不制造结果。
+
+原声通过 HTTPS 上传用户的 Drive，尚未额外实现端到端加密；电脑接口的应用层加密是独立通道。App Groups、HealthKit 和四 target 的真实签名需要相应能力及 profile。模拟器成功不等于 TestFlight 已可安装，也没有证明本应用比苹果自带更省电。
+
+第三方组件和声音模型来源/许可位于 Licenses/，随 Phone bundle 提供并可在设置查看。

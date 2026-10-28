@@ -40,6 +40,7 @@ final class DriveConnection: ObservableObject {
         try update(result.user)
     }
     func access(expectedAccount: String? = nil) async throws -> (token: String, account: String) {
+        guard configured else { throw CloudArchiveError.setupRequired }
         if GIDSignIn.sharedInstance.currentUser == nil { try await restore() }
         guard let current = GIDSignIn.sharedInstance.currentUser else { throw CloudArchiveError.signInRequired }
         let user = try await current.refreshTokensIfNeeded()
@@ -56,18 +57,25 @@ final class DriveConnection: ObservableObject {
 @MainActor
 final class DriveAPI {
     let connection: DriveConnection
-    init(connection: DriveConnection) { self.connection = connection }
+    private let session: URLSession
+    var prepareRequest: ((inout URLRequest) throws -> Void)?
+    init(connection: DriveConnection, session: URLSession = .shared) {
+        self.connection = connection; self.session = session
+    }
     private let base = "https://www.googleapis.com/drive/v3/"
     static let fields = "id,size,sha256Checksum,trashed"
     private func call(_ url: URL, method: String = "GET", body: [String: Any]? = nil,
                       headers: [String: String] = [:], account: String) async throws -> (Data, HTTPURLResponse) {
         try Task.checkCancellation()
         let auth = try await connection.access(expectedAccount: account)
+        try Task.checkCancellation()
         var request = URLRequest(url: url); request.httpMethod = method; request.timeoutInterval = 25
         request.setValue("Bearer \(auth.token)", forHTTPHeaderField: "Authorization")
         if let body = body { request.httpBody = try JSONSerialization.data(withJSONObject: body); request.setValue("application/json; charset=UTF-8", forHTTPHeaderField: "Content-Type") }
         for (key,value) in headers { request.setValue(value, forHTTPHeaderField: key) }
-        let (data,response) = try await URLSession.shared.data(for: request)
+        try prepareRequest?(&request)
+        let (data,response) = try await session.data(for: request)
+        try Task.checkCancellation()
         guard let response = response as? HTTPURLResponse else { throw CloudArchiveError.invalidResponse }
         guard (200..<300).contains(response.statusCode) else { throw CloudArchiveError.http(response.statusCode) }
         return (data,response)

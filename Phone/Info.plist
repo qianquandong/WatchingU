@@ -22,6 +22,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<key>DayTapeAppGroup</key>
+	<string>$(DAYTAPE_APP_GROUP)</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>
@@ -43,9 +45,25 @@
 				<string>$(GOOGLE_REVERSED_CLIENT_ID)</string>
 			</array>
 		</dict>
+		<dict>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>daytape</string>
+			</array>
+		</dict>
 	</array>
 	<key>NSHealthShareUsageDescription</key>
-	<string>读取睡眠记录，在检测到睡眠片段后自动归档之前的录音；睡眠数据不上传。</string>
+	<string>在你开启健康关联后，读取同时间范围的心率、HRV、活动与睡眠样本。数据保存在本机，不用于医疗诊断。</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>在你开启转写后，将本机录音转换成文字。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>在你主动录音或登记本人声纹时使用麦克风。</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>在你配对电脑后，通过本地网络传输加密的录音与笔记。</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_daytape._tcp</string>
+	</array>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>processing</string>

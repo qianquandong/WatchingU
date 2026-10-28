@@ -13,10 +13,11 @@ final class ClipStore {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var cachedIndex: [UUID:Clip]?
+    private var cachedDeletedReceipts: [UUID: Receipt]?
     private var pins: [UUID: Int] = [:]
     func retainAudio(_ id: UUID) -> Bool {
         locked {
-            guard fm.fileExists(atPath: audioURL(id).path) else { return false }
+            guard (try? deletedClipIDs().contains(id)) == false, fm.fileExists(atPath: audioURL(id).path) else { return false }
             pins[id, default: 0] += 1; return true
         }
     }
@@ -47,9 +48,12 @@ final class ClipStore {
     private func receiptURL(_ id: UUID) -> URL { root.appendingPathComponent(id.uuidString + ".ack.json") }
     private func draftURL(_ id: UUID) -> URL { root.appendingPathComponent(id.uuidString + ".draft.json") }
     private func cloudURL(_ id: UUID) -> URL { root.appendingPathComponent(id.uuidString + ".cloud.json") }
-    func hasLocalAudio(_ id: UUID) -> Bool { locked { fm.fileExists(atPath: audioURL(id).path) } }
+    func hasLocalAudio(_ id: UUID) -> Bool {
+        locked { (try? deletedClipIDs().contains(id)) == false && fm.fileExists(atPath: audioURL(id).path) }
+    }
     func cloudReceipt(_ id: UUID) -> CloudReceipt? {
         locked {
+            guard (try? deletedClipIDs().contains(id)) == false else { return nil }
             guard let data = try? Data(contentsOf: cloudURL(id)) else { return nil }
             return try? decoder.decode(CloudReceipt.self, from: data)
         }
@@ -58,14 +62,85 @@ final class ClipStore {
     /// Keep the clip manifest so the timeline and Drive link remain available after local eviction.
     func commitCloudReceipt(_ receipt: CloudReceipt, clip: Clip, purge: Bool, uploadActive: Bool) throws {
         try locked {
+            guard !(try deletedClipIDs().contains(clip.id)) else { throw CloudArchiveError.cancelled }
             guard receipt.matches(clip) else { throw CloudArchiveError.remoteMismatch }
             try save(receipt, at: cloudURL(clip.id))
             let persisted = cloudReceipt(clip.id)?.matches(clip) == true
+            let processingHeld = fm.fileExists(atPath: root.appendingPathComponent(clip.id.uuidString + ".processing-hold").path)
             if rr_can_purge_cloud_copy(1, persisted ? 1 : 0, uploadActive ? 1 : 0,
-                                      purge && (pins[clip.id] ?? 0) == 0 ? 0 : 1) != 0 {
+                                      purge && !processingHeld && (pins[clip.id] ?? 0) == 0 ? 0 : 1) != 0 {
                 if fm.fileExists(atPath: audioURL(clip.id).path) { try fm.removeItem(at: audioURL(clip.id)) }
             }
         }
+    }
+
+    /// Explicit user deletion never touches Drive. A minimal tombstone prevents a late
+    /// already-acknowledged Watch retransmission from restoring a deleted recording.
+    func deleteByUser(_ clip: Clip) throws {
+        defer { NotificationCenter.default.post(name: .archiveChanged, object: nil) }
+        try locked {
+            guard (pins[clip.id] ?? 0) == 0 else { throw ArchiveError.conflict }
+            // Even if protection/synchronization or later removal fails, the next read must honor
+            // any tombstone that reached disk before the error.
+            defer { cachedDeletedReceipts = nil; cachedIndex = nil }
+            try save(Receipt(clip: clip), at: root.appendingPathComponent(clip.id.uuidString + ".deleted.json"))
+            cachedIndex?.removeValue(forKey: clip.id)
+            cachedDeletedReceipts = nil
+            try purgeDeletedAudio()
+        }
+    }
+
+    /// Authoritative deletion intents. The small receipts are decoded once per store lifetime,
+    /// and invalidated only when this store writes another tombstone.
+    func deletedClipIDs() throws -> Set<UUID> { try locked { Set(try deletedReceipts().keys) } }
+    private func deletedReceipts() throws -> [UUID: Receipt] {
+        if let cachedDeletedReceipts { return cachedDeletedReceipts }
+        var result: [UUID: Receipt] = [:]
+        for url in try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+            where url.lastPathComponent.hasSuffix(".deleted.json") {
+            let name = String(url.lastPathComponent.dropLast(".deleted.json".count))
+            let receipt = try decoder.decode(Receipt.self, from: Data(contentsOf: url))
+            guard let id = UUID(uuidString: name), receipt.clipID == id,
+                  receipt.byteCount > 0, receipt.byteCount < 16 * 1024 * 1024,
+                  receipt.sha256.count == 64,
+                  receipt.sha256.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
+                  receipt.savedAt.timeIntervalSince1970.isFinite else { throw ArchiveError.invalidMetadata }
+            result[id] = receipt
+        }
+        cachedDeletedReceipts = result; return result
+    }
+    func pendingDeletedAudioIDs(only ids: Set<UUID>? = nil) throws -> Set<UUID> {
+        try locked {
+            Set(try deletedReceipts().keys.filter { id in
+                (ids == nil || ids?.contains(id) == true) && deletionURLs(id).contains { fm.fileExists(atPath: $0.path) }
+            })
+        }
+    }
+    /// Retries only local files for validated tombstones; the tombstone and Drive copy remain.
+    func purgeDeletedAudio(only ids: Set<UUID>? = nil) throws {
+        try locked {
+            var firstError: Error?
+            for (id, receipt) in try deletedReceipts() {
+                if let ids, !ids.contains(id) { continue }
+                do {
+                    guard (pins[id] ?? 0) == 0 else { throw ArchiveError.conflict }
+                    if fm.fileExists(atPath: manifestURL(id).path) {
+                        let clip = try decoder.decode(Clip.self, from: Data(contentsOf: manifestURL(id)))
+                        guard receipt.matches(clip) else { throw ArchiveError.conflict }
+                    }
+                    for url in deletionURLs(id) where fm.fileExists(atPath: url.path) {
+                        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                        guard values.isRegularFile == true, values.isSymbolicLink != true else { throw ArchiveError.invalidMetadata }
+                        try fm.removeItem(at: url)
+                    }
+                    cachedIndex?.removeValue(forKey: id)
+                } catch { if firstError == nil { firstError = error } }
+            }
+            if let firstError { throw firstError }
+        }
+    }
+    private func deletionURLs(_ id: UUID) -> [URL] {
+        [audioURL(id), cloudURL(id), root.appendingPathComponent(id.uuidString + ".processing-hold"), manifestURL(id)]
     }
 
     private func protect(_ url: URL) throws {
@@ -93,9 +168,14 @@ final class ClipStore {
     }
     func clips() throws -> [Clip] {
         try locked {
-            if let index = cachedIndex { return index.values.sorted { $0.startedAt < $1.startedAt } }
+            let deleted = try deletedClipIDs()
+            if let index = cachedIndex { return index.values.filter { !deleted.contains($0.id) }.sorted { $0.startedAt < $1.startedAt } }
             let result = try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
                 .filter { $0.lastPathComponent.hasSuffix(".clip.json") }
+                .filter { url in
+                    guard let id = UUID(uuidString: String(url.lastPathComponent.dropLast(".clip.json".count))) else { return true }
+                    return !deleted.contains(id)
+                }
                 .map {
                     let clip = try decoder.decode(Clip.self, from: Data(contentsOf: $0))
                     guard clip.isValid else { throw ArchiveError.invalidMetadata }
@@ -157,6 +237,12 @@ final class ClipStore {
             guard clip.isValid else { throw ArchiveError.invalidMetadata }
             let (count, digest) = try hash(inbox)
             guard count == clip.byteCount && digest == clip.sha256 else { throw ArchiveError.checksumMismatch }
+            let tombstone = root.appendingPathComponent(clip.id.uuidString + ".deleted.json")
+            if fm.fileExists(atPath: tombstone.path) {
+                let receipt = try decoder.decode(Receipt.self, from: Data(contentsOf: tombstone))
+                guard receipt.matches(clip) else { throw ArchiveError.conflict }
+                return receipt
+            }
             let destination = audioURL(clip.id)
             if fm.fileExists(atPath: destination.path) {
                 let current = try hash(destination)

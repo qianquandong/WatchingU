@@ -22,6 +22,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<key>DayTapeAppGroup</key>
+	<string>$(DAYTAPE_APP_GROUP)</string>
 	<key>WKApplication</key>
 	<true/>
 	<key>WKCompanionAppBundleIdentifier</key>
@@ -32,7 +34,18 @@
 	<array>
 		<string>audio</string>
 	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>daytape</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>在你点击开始后录制声音，保存到你的手表并传到配对 iPhone。</string>
+	<string>在你点击开始后录制声音，保存到手表并同步到配对 iPhone。</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>仅在你开启大致位置记录后，低频采样录音时所在的大致区域。</string>
 </dict>
 </plist>
