@@ -2,7 +2,8 @@
 """Inspect the explicitly selected DayTape recipient without exposing identity.
 
 The address is accepted only from TF_INVITATION_EMAIL, never a command argument.
-This script never creates an ASC user, changes roles, creates a tester or submits review.
+This script never creates an ASC user, changes roles or submits review. Explicit
+invite mode may create only the selected eligible recipient's missing App tester.
 """
 from __future__ import annotations
 import argparse
@@ -144,9 +145,46 @@ def inspect_recipient(api, target, build_number=BUILD_NUMBER, marketing=MARKETIN
 def invite_internal(api, target, build_number=BUILD_NUMBER, marketing=MARKETING_VERSION, group_id=GROUP_ID):
     """Only add this existing eligible recipient and make at most one invitation request."""
     actions = dict(mode="invite-internal", membership_added=False, invitation_attempted=False,
-                   invitation_request_accepted=None)
+                   invitation_request_accepted=None, tester_creation_attempted=False,
+                   tester_creation_request_accepted=None, tester_creation_confirmed=False)
     report = inspect_recipient(api, target, build_number, marketing, group_id)
     report.update(actions)
+    if report.get("target_tester_count") == 0:
+        if not creation_allowed(report):
+            return report
+        actions["tester_creation_attempted"] = True
+        creation_failure = None
+        try:
+            # ASC.request must not retry this non-idempotent endpoint. The body
+            # contains only the chosen address and the pre-existing internal group.
+            api.request("POST", "/v1/betaTesters", body={"data": {
+                "type": "betaTesters", "attributes": {"email": target},
+                "relationships": {"betaGroups": {"data": [{"type": "betaGroups", "id": GROUP_ID}]}}
+            }})
+            actions["tester_creation_request_accepted"] = True
+        except APIError as error:
+            actions["tester_creation_api_status"] = error.status
+            actions["tester_creation_request_accepted"] = False if 400 <= error.status < 500 else None
+            creation_failure = "TESTER_CREATION_CONFLICT_RECHECKED" if error.status == 409 else "TESTER_CREATION_REQUEST_FAILED"
+        except AccessError:
+            creation_failure = "TESTER_CREATION_RESULT_UNCONFIRMED"
+        try:
+            refreshed = inspect_recipient(api, target, build_number, marketing, group_id)
+        except (AccessError, ValueError, KeyError, TypeError):
+            report.update(actions, ready=False, reason="TESTER_CREATION_RECHECK_FAILED")
+            return report
+        report = refreshed; report.update(actions)
+        if creation_failure is not None:
+            # A conflict or lost response allows reads only for this invocation.
+            # Even a currently NOT_INVITED readback must not trigger a second send.
+            report.update(ready=False, reason=creation_failure)
+            return report
+        if (report.get("target_tester_count") != 1 or not report.get("target_group_member")
+                or report.get("tester_app_scope_readable") is not True):
+            report.update(ready=False, reason="TARGET_TESTER_CREATION_WAITING")
+            return report
+        actions["tester_creation_confirmed"] = True
+        report.update(actions)
     if report["blocking_reasons"] or report.get("eligible") is not True:
         return report
     initial_state = report.get("target_tester_state")
@@ -215,6 +253,18 @@ def invite_internal(api, target, build_number=BUILD_NUMBER, marketing=MARKETING_
     if not report["blocking_reasons"] and report.get("target_tester_state") == "NOT_INVITED":
         report.update(ready=False, reason="INVITATION_AWAITING_CONFIRMATION")
     return report
+
+
+def creation_allowed(report):
+    """Only a proven zero-result App lookup can justify creating this tester."""
+    return (report.get("eligible") is True and report.get("app_visible") is True
+        and report.get("target_user_count") == 1 and report.get("internal_group_valid") is True
+        and report.get("tester_app_scope_readable") is True
+        and report.get("target_tester_candidate_count") == 0 and report.get("target_tester_count") == 0
+        and report.get("build_expired") is False and report.get("processing_state") == "VALID"
+        and report.get("internal_build_state") == "IN_BETA_TESTING" and report.get("build_assigned") is True
+        and bool(report.get("blocking_reasons"))
+        and all(reason == "TARGET_TESTER_NOT_FOUND" for reason in report["blocking_reasons"]))
 
 
 def readiness_reason(report):

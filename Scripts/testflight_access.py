@@ -114,9 +114,10 @@ class ASC:
         url = trusted_url(path)
         if params:
             url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
-        # Invitation sends are not idempotent. A lost response must be inspected,
-        # never retried automatically while Apple's state may still be catching up.
-        retry_allowed = not (method == "POST" and urllib.parse.urlsplit(url).path == "/v1/betaTesterInvitations")
+        # Creating a tester or sending an invitation is not idempotent. A lost
+        # response must be inspected, never automatically retried while state lags.
+        retry_allowed = not (method == "POST" and urllib.parse.urlsplit(url).path in {
+            "/v1/betaTesterInvitations", "/v1/betaTesters"})
         for attempt in range(3):
             req = urllib.request.Request(url, method=method,
                 headers={"Authorization": "Bearer " + self.token(), "Accept": "application/json", "Content-Type": "application/json"},

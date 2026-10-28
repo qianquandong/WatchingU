@@ -339,12 +339,14 @@ class TestFlightAccessTests(unittest.TestCase):
             def open(self, req, timeout):
                 self.calls += 1
                 raise urllib.error.URLError("owner@example.com not-a-real-token")
-        api.opener = FailingNetwork()
-        with self.assertRaises(tf.AccessError) as error:
-            api.request("POST", "/v1/betaTesterInvitations", body={"data": {}})
-        self.assertEqual(api.opener.calls, 1)
-        self.assertNotIn("owner@example.com", str(error.exception))
-        self.assertNotIn("not-a-real-token", str(error.exception))
+        for path in ("/v1/betaTesterInvitations", "/v1/betaTesters"):
+            with self.subTest(path=path):
+                api.opener = FailingNetwork()
+                with self.assertRaises(tf.AccessError) as error:
+                    api.request("POST", path, body={"data": {}})
+                self.assertEqual(api.opener.calls, 1)
+                self.assertNotIn("owner@example.com", str(error.exception))
+                self.assertNotIn("not-a-real-token", str(error.exception))
 
     def test_jwt_is_es256_and_contains_only_the_required_short_lived_claims(self):
         from cryptography.hazmat.primitives import serialization, hashes
