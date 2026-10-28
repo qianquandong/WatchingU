@@ -361,6 +361,13 @@ run_private archive xcodebuild \
   CODE_SIGN_STYLE="$(python3 -c 'import os; print(os.environ["APPLE_SIGNING_STYLE"].capitalize())')" \
   archive
 
+if [[ "$APPLE_SIGNING_STYLE" == automatic ]]; then
+  # Export inherits capability claims from archive signatures. Seed private ad-hoc
+  # signatures first; the export step must still produce real distribution signing.
+  run_private preserve-entitlements python3 Scripts/preserve_archive_entitlements.py \
+    --archive "$TF_PRIVATE_DIR/DayTape.xcarchive"
+fi
+
 run_private export xcodebuild -exportArchive \
   -archivePath "$TF_PRIVATE_DIR/DayTape.xcarchive" \
   -exportPath "$TF_PRIVATE_DIR/export" -exportOptionsPlist "$TF_PRIVATE_DIR/export.plist" \
@@ -464,12 +471,23 @@ for label, app, identifier in [('iPhone', apps[0], bundle),
         raise SystemExit(label + ' was not signed for the configured Apple team.')
     profile_entitlements = profile.get('Entitlements', {})
     group = os.environ['DAYTAPE_APP_GROUP']
-    if (group not in signature.get('com.apple.security.application-groups', []) or
-            group not in profile_entitlements.get('com.apple.security.application-groups', [])):
-        raise SystemExit(label + ' signed entitlements/profile do not allow the shared App Group.')
-    if label == 'iPhone' and (not signature.get('com.apple.developer.healthkit') or
-                              not profile_entitlements.get('com.apple.developer.healthkit')):
-        raise SystemExit('The iPhone signature/profile must support opt-in HealthKit.')
+    signature_group = group in signature.get('com.apple.security.application-groups', [])
+    profile_group = group in profile_entitlements.get('com.apple.security.application-groups', [])
+    print(label + ' distribution capabilities: signature_app_group=' + str(signature_group).lower()
+          + ', profile_app_group=' + str(profile_group).lower()
+          + ', signature_healthkit=' + str(bool(signature.get('com.apple.developer.healthkit'))).lower()
+          + ', profile_healthkit=' + str(bool(profile_entitlements.get('com.apple.developer.healthkit'))).lower())
+    if not signature_group:
+        raise SystemExit(label + ' distribution SIGNATURE is missing the required shared App Group.')
+    if not profile_group:
+        raise SystemExit(label + ' distribution PROFILE does not authorize the required shared App Group.')
+    if label == 'iPhone':
+        for key, capability in [('com.apple.developer.healthkit', 'HealthKit'),
+                                ('com.apple.developer.healthkit.background-delivery', 'HealthKit background delivery')]:
+            if not signature.get(key):
+                raise SystemExit('The iPhone distribution SIGNATURE is missing ' + capability + '.')
+            if not profile_entitlements.get(key):
+                raise SystemExit('The iPhone distribution PROFILE does not authorize ' + capability + '.')
     app_id = signature.get('application-identifier')
     prefixes = profile.get('ApplicationIdentifierPrefix', [])
     if (not any(app_id == prefix + '.' + identifier for prefix in prefixes)
