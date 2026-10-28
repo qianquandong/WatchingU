@@ -85,6 +85,7 @@ class FakeProvisioningASC:
     def __init__(self):
         self.calls = []
         self.denied = set()
+        self.illegal = set()
         prefix = "com.aimanjack.daytape"
         self.bundles = {prefix + suffix: resource("bundleIds", "bundle" + str(i),
             identifier=prefix + suffix, seedId="TEAM123456")
@@ -94,6 +95,8 @@ class FakeProvisioningASC:
         self.calls.append(("GET", path, params))
         if path in self.denied:
             raise tf.APIError(403)
+        if path in self.illegal:
+            raise tf.APIError(400, ["PARAMETER_ERROR.ILLEGAL"])
         if path == "/v1/bundleIds":
             entry = self.bundles.get(params["filter[identifier]"])
             return [entry] if entry else []
@@ -151,6 +154,23 @@ class TestFlightAccessTests(unittest.TestCase):
         self.assertTrue(all(b["exists"] is False for b in report["bundles"]))
         self.assertEqual(len(api.calls), 4)
         self.assertTrue(all(c[1] == "/v1/bundleIds" for c in api.calls))
+
+    def test_provisioning_uses_default_pagination_without_assuming_endpoint_limits(self):
+        api = FakeProvisioningASC()
+        tf.inspect_provisioning(api, options(mode="inspect-provisioning"))
+        # All three first-page endpoints omit limit and use the API's default.
+        # This stays below any published maximum; ASC.listing follows links.next.
+        self.assertTrue(all("limit" not in query for _, _, query in api.calls))
+
+    def test_provisioning_parameter_errors_have_only_a_static_phase_and_safe_codes(self):
+        cases = [("/v1/bundleIds", "bundle lookup"),
+            ("/v1/bundleIds/bundle0/bundleIdCapabilities", "capability metadata"),
+            ("/v1/bundleIds/bundle0/profiles", "profile metadata")]
+        for path, phase in cases:
+            api = FakeProvisioningASC(); api.illegal.add(path)
+            with self.assertRaises(tf.AccessError) as error:
+                tf.inspect_provisioning(api, options(mode="inspect-provisioning"))
+            self.assertEqual(str(error.exception), "Provisioning phase=" + phase + ": ASC HTTP 400: PARAMETER_ERROR.ILLEGAL")
 
     def test_forbidden_provisioning_metadata_is_distinct_from_absent_or_empty(self):
         api = FakeProvisioningASC(); api.denied.add("/v1/bundleIds")

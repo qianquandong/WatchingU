@@ -273,10 +273,10 @@ def inspect_provisioning(api, options):
         report["bundles"].append(item)
         try:
             found = api.listing("/v1/bundleIds", {"filter[identifier]": bundle,
-                "fields[bundleIds]": "identifier,seedId", "limit": 2})
+                "fields[bundleIds]": "identifier,seedId"})
         except APIError as error:
             if error.status != 403:
-                raise
+                raise AccessError("Provisioning phase=bundle lookup: " + str(error)) from None
             item.update(bundle_metadata_readable=False, reason="API_KEY_CANNOT_READ_BUNDLE_IDS")
             continue
         matches = [b for b in found if attributes(b).get("identifier") == bundle]
@@ -289,17 +289,19 @@ def inspect_provisioning(api, options):
         seed = attributes(matches[0]).get("seedId")
         item.update(bundle_resource_id=bid, seed_id=None if seed is None else safe_name(seed))
         try:
+            # Use server-default page sizes and follow links.next. Published maximums
+            # can differ from the deployed service; no explicit limit is needed here.
             capabilities = api.listing(f"/v1/bundleIds/{bid}/bundleIdCapabilities",
-                {"fields[bundleIdCapabilities]": "capabilityType", "limit": 200})
+                {"fields[bundleIdCapabilities]": "capabilityType"})
             item.update(capabilities_readable=True, capability_types=sorted({
                 safe_name(attributes(c).get("capabilityType", "UNKNOWN")) for c in capabilities}))
         except APIError as error:
             if error.status != 403:
-                raise
+                raise AccessError("Provisioning phase=capability metadata: " + str(error)) from None
             item.update(capabilities_readable=False, capabilities_reason="API_KEY_CANNOT_READ_CAPABILITIES")
         try:
             profiles = api.listing(f"/v1/bundleIds/{bid}/profiles",
-                {"fields[profiles]": "profileType,profileState", "limit": 200})
+                {"fields[profiles]": "profileType,profileState"})
             counts = Counter((safe_name(attributes(p).get("profileType", "UNKNOWN")),
                 safe_name(attributes(p).get("profileState", "UNKNOWN"))) for p in profiles)
             item.update(profile_metadata_readable=True, profile_count=len(profiles),
@@ -307,7 +309,7 @@ def inspect_provisioning(api, options):
                     for (kind, state), count in sorted(counts.items())])
         except APIError as error:
             if error.status != 403:
-                raise
+                raise AccessError("Provisioning phase=profile metadata: " + str(error)) from None
             item.update(profile_metadata_readable=False, profiles_reason="API_KEY_CANNOT_READ_PROFILE_METADATA")
     return report
 
