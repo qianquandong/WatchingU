@@ -1,5 +1,6 @@
 import SwiftUI
 import WidgetKit
+import UIKit
 
 @MainActor
 struct DayTapeRootView: View {
@@ -35,7 +36,7 @@ struct DayTapeRootView: View {
             NavigationStack { settings }.tabItem { Label("设置", systemImage: "slider.horizontal.3") }.tag(3)
         }
         .tint(mint)
-        .task { services.setForegroundActive(true); refresh(); await archive.wake() }
+        .task { services.setForegroundActive(UIApplication.shared.applicationState == .active); refresh(); await archive.wake() }
         .onReceive(NotificationCenter.default.publisher(for: .archiveChanged)) { _ in refresh() }
         .onReceive(NotificationCenter.default.publisher(for: .archiveDisplayChanged)) { _ in refresh() }
         .onChange(of: intelligence.reviews) { _, _ in updateWidget(force: true) }
@@ -128,6 +129,7 @@ struct DayTapeRootView: View {
                 NavigationLink("电脑只读接入") { DesktopBridgeView(bridge: desktop) }
                 Button("批量导出录音、文字和回顾") { showExport = true }.disabled(clips.isEmpty)
                 Toggle("小组件显示回顾标题", isOn: $widgetTitles).onChange(of: widgetTitles) { _, _ in updateWidget(force: true) }
+                NavigationLink("组件与模型来源") { ThirdPartyNoticesView() }
             }
         }.navigationTitle("设置")
     }
@@ -301,6 +303,7 @@ struct VoiceIdentitySettingsView: View {
                         if !value { service.pause() }
                     }
                 Button(service.isBusy ? "正在准备…" : "下载并准备声音模型") { Task { await service.prepare() } }.disabled(service.isBusy || service.recording)
+                Text("首次需联网下载本机模型；录音和声纹在本机处理。").font(.caption).foregroundStyle(.secondary)
                 Text(service.status).font(.caption).foregroundStyle(.secondary)
                 if let error = service.errorText { Text(error).foregroundStyle(.orange) }
             }
@@ -318,6 +321,25 @@ struct VoiceIdentitySettingsView: View {
             }
         }.navigationTitle("声音识别")
         .onDisappear { service.cancelEnrollment() }
+    }
+}
+
+struct ThirdPartyNoticesView: View {
+    var body: some View {
+        List {
+            NavigationLink("声音模型来源与许可") { LicenseTextView(resource: "ModelAttribution") }
+            NavigationLink("FluidAudio · Apache 2.0") { LicenseTextView(resource: "FluidAudio-APACHE-2.0") }
+        }.navigationTitle("组件与模型来源")
+    }
+}
+
+private struct LicenseTextView: View {
+    let resource: String
+    var body: some View {
+        ScrollView {
+            Text(Bundle.main.url(forResource: resource, withExtension: "txt").flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? "许可证资源未包含在此构建中。")
+                .font(.caption).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding()
+        }.navigationTitle("来源与许可").navigationBarTitleDisplayMode(.inline)
     }
 }
 
@@ -352,13 +374,13 @@ struct BulkExportView: View {
                         ForEach(0..<24, id: \.self) { Text(String(format: "%02d:00–%02d:59", $0, $0)).tag($0) }
                     }
                     LabeledContent("选中录音", value: "\(selected.count) 段")
-                }
+                }.disabled(exporting)
                 Section("包含") {
                     Toggle("本机保留的原声", isOn: $options.audio)
                     Toggle("转写文字与时间戳", isOn: $options.transcripts)
                     Toggle("AI 回顾", isOn: $options.reviews)
                     Toggle("重要标记与可选关联", isOn: $options.context)
-                }
+                }.disabled(exporting)
                 if let error = errorText { Section { Text(error).foregroundStyle(.orange) } }
                 Section {
                     Button(exporting ? "正在打包…" : "生成 ZIP 并分享") {

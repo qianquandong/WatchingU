@@ -96,12 +96,12 @@ final class IntelligenceDisk {
 
 enum IntelligenceKeychain {
     private static var service: String { (Bundle.main.bundleIdentifier ?? "DayTape") + ".intelligence" }
-    private static var query: [String: Any] {
+    private static func query(account: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
-         kSecAttrService as String: service, kSecAttrAccount as String: "compatible-api-key"]
+         kSecAttrService as String: service, kSecAttrAccount as String: account]
     }
-    static func read() throws -> String? {
-        var request = query
+    static func read(account: String = "compatible-api-key") throws -> String? {
+        var request = query(account: account)
         request[kSecReturnData as String] = true
         request[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
@@ -113,7 +113,8 @@ enum IntelligenceKeychain {
         }
         return key
     }
-    static func save(_ value: String) throws {
+    static func save(_ value: String, account: String = "compatible-api-key") throws {
+        let query = query(account: account)
         let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if value.isEmpty {
             let status = SecItemDelete(query as CFDictionary)

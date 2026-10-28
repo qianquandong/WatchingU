@@ -21,10 +21,13 @@ struct ChargingBackupPolicy {
         return clipEnd <= cutoff
     }
 
-    static func reminderDate(oldestPendingEnd: Date, lastScheduledAlert: Date?) -> Date? {
+    static func reminderDate(oldestPendingEnd: Date, lastScheduledAlert: Date?, now: Date = Date()) -> Date? {
         guard oldestPendingEnd.timeIntervalSince1970.isFinite else { return nil }
         let due = oldestPendingEnd.addingTimeInterval(reminderDelay)
-        guard let previous = lastScheduledAlert, previous.timeIntervalSince1970.isFinite else { return due }
+        // Replacing a not-yet-due request does not count as an alert. Otherwise deleting or
+        // backing up the oldest clip before delivery would postpone the next one to 48h.
+        guard let previous = lastScheduledAlert, previous.timeIntervalSince1970.isFinite,
+              previous <= now else { return due }
         return max(due, previous.addingTimeInterval(reminderDelay))
     }
 }

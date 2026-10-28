@@ -10,6 +10,12 @@ struct IntelligenceSettingsView: View {
     @State private var model = ""
     @State private var apiKey = ""
     @State private var configurationError: String?
+    @State private var asrEndpoint = ""
+    @State private var asrModel = ""
+    @State private var asrLanguage = ""
+    @State private var asrResponseFormat = "verbose_json"
+    @State private var asrKey = ""
+    @State private var asrError: String?
     private var hasUnsavedProvider: Bool {
         endpoint.trimmingCharacters(in: .whitespacesAndNewlines) != controller.settings.apiBaseURL ||
         model.trimmingCharacters(in: .whitespacesAndNewlines) != controller.settings.model || !apiKey.isEmpty
@@ -18,27 +24,41 @@ struct IntelligenceSettingsView: View {
         Array(Set((IntelligenceController.supportedLocales.map { $0.identifier.replacingOccurrences(of: "_", with: "-") }) +
                   [controller.settings.localeIdentifier])).sorted()
     }
+    private var hasUnsavedASRProvider: Bool {
+        asrEndpoint.trimmingCharacters(in: .whitespacesAndNewlines) != (controller.settings.remoteASRBaseURL ?? "") ||
+        asrModel.trimmingCharacters(in: .whitespacesAndNewlines) != (controller.settings.remoteASRModel ?? "") ||
+        asrLanguage.trimmingCharacters(in: .whitespacesAndNewlines) != (controller.settings.remoteASRLanguage ?? "") ||
+        asrResponseFormat != (controller.settings.remoteASRResponseFormat ?? "verbose_json") || !asrKey.isEmpty
+    }
     var body: some View {
         Form {
             Section {
-                Picker("转写语言", selection: Binding(get: { controller.settings.localeIdentifier }, set: {
-                    controller.settings.localeIdentifier = $0; controller.saveSettings()
+                Picker("转写方式", selection: Binding(get: { controller.transcriptionBackend }, set: {
+                    controller.settings.transcriptionBackend = $0; controller.saveSettings()
                 })) {
-                    ForEach(languages, id: \.self) { language in
-                        Text(Locale(identifier: "zh-CN").localizedString(forIdentifier: language) ?? language).tag(language)
+                    ForEach(IntelligenceSettings.TranscriptionBackend.allCases) { backend in Text(backend.title).tag(backend) }
+                }
+                if controller.transcriptionBackend == .onDevice {
+                    Picker("本机转写语言", selection: Binding(get: { controller.settings.localeIdentifier }, set: {
+                    controller.settings.localeIdentifier = $0; controller.saveSettings()
+                    })) {
+                        ForEach(languages, id: \.self) { language in
+                            Text(Locale(identifier: "zh-CN").localizedString(forIdentifier: language) ?? language).tag(language)
+                        }
                     }
                 }
                 Toggle("自动转写收到的录音", isOn: Binding(get: { controller.settings.automaticTranscription }, set: {
                     controller.settings.automaticTranscription = $0; controller.saveSettings()
                 }))
-                Button(controller.isProcessing ? "暂停转写" : "继续本地转写") {
+                Button(controller.isProcessing ? "暂停转写" : "开始或继续转写") {
                     if controller.isProcessing { controller.pauseTranscription() }
                     else { controller.startTranscription() }
                 }
-                if controller.isProcessing { ProgressView("正在本机处理") }
-            } header: { Text("本地转写") } footer: {
-                Text("使用本机语音模型。语言模型不可用时会提示并保留录音。后台处理受系统运行机会限制。")
+                if controller.isProcessing { ProgressView("正在按所选方式处理") }
+            } header: { Text("转写") } footer: {
+                Text("本机模型不可用时会提示，不会自动改为上传。自动服务转写只在手机充电时运行；手动开始可在电池供电时执行。后台处理受系统运行机会限制。")
             }
+            if controller.transcriptionBackend == .configuredService { remoteASRSection }
             Section {
                 LabeledContent("待处理", value: "\(controller.jobs.filter { $0.state != .completed }.count) 段")
                 LabeledContent("已完成", value: "\(controller.documents.filter(\.isComplete).count) 段")
@@ -93,7 +113,57 @@ struct IntelligenceSettingsView: View {
             }
         }
         .navigationTitle("转写与 AI").tint(intelligenceMint).preferredColorScheme(.dark)
-        .onAppear { endpoint = controller.settings.apiBaseURL; model = controller.settings.model; controller.refresh() }
+        .onAppear {
+            endpoint = controller.settings.apiBaseURL; model = controller.settings.model
+            asrEndpoint = controller.settings.remoteASRBaseURL ?? ""; asrModel = controller.settings.remoteASRModel ?? ""
+            asrLanguage = controller.settings.remoteASRLanguage ?? ""; asrResponseFormat = controller.settings.remoteASRResponseFormat ?? "verbose_json"
+            controller.refresh()
+        }
+    }
+    private var remoteASRSection: some View {
+        Section {
+            TextField("HTTPS 转写 API 地址，例如 https://…/v1", text: $asrEndpoint)
+                .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+            TextField("转写模型名称", text: $asrModel).textInputAutocapitalization(.never).autocorrectionDisabled()
+            TextField("语言代码（可选，例如 zh；留空自动识别）", text: $asrLanguage)
+                .textInputAutocapitalization(.never).autocorrectionDisabled()
+            Picker("响应格式", selection: $asrResponseFormat) {
+                Text("带时间戳 · verbose_json").tag("verbose_json")
+                Text("文字 · json").tag("json")
+            }
+            SecureField(controller.hasRemoteASRKey ? "输入新转写密钥以替换" : "转写服务独立 API 密钥", text: $asrKey)
+                .textInputAutocapitalization(.never).autocorrectionDisabled()
+            if controller.hasRemoteASRKey { Label("转写密钥已单独保存", systemImage: "key.fill").font(.caption).foregroundStyle(intelligenceMint) }
+            Button("保存转写服务") { saveASRProvider() }
+            if let address = try? RemoteSpeechTranscriber.endpoint(controller.settings.remoteASRBaseURL ?? "") {
+                LabeledContent("录音接收地址", value: address.absoluteString).font(.caption).textSelection(.enabled)
+            }
+            Toggle("允许向此服务分享原始录音", isOn: Binding(get: { controller.settings.remoteASRSharingEnabled == true }, set: {
+                if $0 && hasUnsavedASRProvider { asrError = "请先保存转写服务，再明确允许分享录音。"; return }
+                controller.settings.remoteASRSharingEnabled = $0; controller.saveSettings()
+            }))
+            if let asrError { Text(asrError).font(.caption).foregroundStyle(.orange) }
+            if controller.hasRemoteASRKey {
+                Button("删除转写密钥并停止分享录音", role: .destructive) {
+                    do { try controller.setRemoteASRKey(""); asrKey = "" } catch { asrError = error.localizedDescription }
+                }
+            }
+        } header: { Text("可选云端或自建转写") } footer: {
+            Text("这个独立开关允许将录音片段发送到上方服务，服务商可能收费。它不同于下方只发送文字的 AI 开关。关闭后会立即暂停远程转写，原声保留在本机。")
+        }
+    }
+    private func saveASRProvider() {
+        do {
+            _ = try RemoteSpeechTranscriber.endpoint(asrEndpoint)
+            guard !asrModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw IntelligenceError.message("请输入转写模型名称。") }
+            if !asrKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { try controller.setRemoteASRKey(asrKey) }
+            controller.settings.remoteASRBaseURL = asrEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+            controller.settings.remoteASRModel = asrModel.trimmingCharacters(in: .whitespacesAndNewlines)
+            controller.settings.remoteASRLanguage = asrLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+            controller.settings.remoteASRResponseFormat = asrResponseFormat
+            controller.saveSettings()
+            if controller.lastError == nil { asrKey = ""; asrError = nil }
+        } catch { asrError = error.localizedDescription }
     }
     private func saveProvider() {
         do {

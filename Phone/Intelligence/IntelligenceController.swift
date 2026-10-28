@@ -2,6 +2,7 @@ import Foundation
 import Combine
 import NaturalLanguage
 import UIKit
+import CryptoKit
 
 private actor LocalTranscriptSearch {
     struct Result { let hits: [SearchHit]; let semanticAvailable: Bool }
@@ -57,6 +58,7 @@ final class IntelligenceController: ObservableObject {
     let store: ClipStore
     private var disk: IntelligenceDisk?
     private let speech = LocalSpeechTranscriber()
+    private let remoteSpeech = RemoteSpeechTranscriber()
     private let localSearch = LocalTranscriptSearch()
     private var processTask: Task<Void, Never>?
     private var remoteTask: Task<AIWireReply, Error>?
@@ -66,14 +68,18 @@ final class IntelligenceController: ObservableObject {
     private var savedSettings = IntelligenceSettings()
     private var clipIndex: [UUID: Clip] = [:]
     private var archiveObserver: NSObjectProtocol?
+    private var batteryObserver: NSObjectProtocol?
     private var activeClipID: UUID?
     private var excludedClipIDs: Set<UUID> = []
     private var queuePaused = false
     private var executionAllowed = false
     private var automaticReviewAttempts: [String: Date] = [:]
+    private var activeWorkerIsManual = false
 
     static var supportedLocales: [Locale] { LocalSpeechTranscriber.supportedLocales }
     var hasAPIKey: Bool { ((try? IntelligenceKeychain.read()) ?? nil)?.isEmpty == false }
+    var hasRemoteASRKey: Bool { ((try? IntelligenceKeychain.read(account: "speech-api-key")) ?? nil)?.isEmpty == false }
+    var transcriptionBackend: IntelligenceSettings.TranscriptionBackend { settings.transcriptionBackend ?? .onDevice }
     var pendingClipIDs: Set<UUID> {
         Set(jobs.filter { $0.state != .completed }.map(\.clipID))
     }
@@ -115,9 +121,23 @@ final class IntelligenceController: ObservableObject {
         archiveObserver = NotificationCenter.default.addObserver(forName: .archiveChanged, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        batteryObserver = NotificationCenter.default.addObserver(forName: UIDevice.batteryStateDidChangeNotification,
+                                                                object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                if !self.connectedToPower && self.transcriptionBackend == .configuredService && !self.activeWorkerIsManual {
+                    self.processTask?.cancel(); self.remoteSpeech.cancel()
+                }
+                if self.connectedToPower && self.executionAllowed { self.refresh(); await self.automaticWorkIfAllowed() }
+            }
+        }
     }
 
-    deinit { if let archiveObserver { NotificationCenter.default.removeObserver(archiveObserver) } }
+    deinit {
+        if let archiveObserver { NotificationCenter.default.removeObserver(archiveObserver) }
+        if let batteryObserver { NotificationCenter.default.removeObserver(batteryObserver) }
+    }
 
     func refresh() {
         guard disk != nil else { return }
@@ -131,7 +151,15 @@ final class IntelligenceController: ObservableObject {
     }
 
     func saveSettings() {
+        if settings.apiBaseURL != savedSettings.apiBaseURL {
+            settings.remoteAIEnabled = false; invalidateAIWork()
+        }
+        if settings.remoteASRBaseURL != savedSettings.remoteASRBaseURL {
+            settings.remoteASRSharingEnabled = false
+            if transcriptionBackend == .configuredService { processTask?.cancel(); remoteSpeech.cancel() }
+        }
         let requestedRemoteDisable = !settings.remoteAIEnabled
+        let requestedASRDisable = settings.remoteASRSharingEnabled != true
         do {
             if settings.remoteAIEnabled {
                 _ = try CompatibleAIClient.endpoint(settings.apiBaseURL)
@@ -139,6 +167,14 @@ final class IntelligenceController: ObservableObject {
                     throw IntelligenceError.message("请先保存 API 密钥、HTTPS 地址和模型，再开启远程 AI。")
                 }
             }
+            if settings.remoteASRSharingEnabled == true {
+                _ = try RemoteSpeechTranscriber.endpoint(settings.remoteASRBaseURL ?? "")
+                guard !(settings.remoteASRModel ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, hasRemoteASRKey else {
+                    throw IntelligenceError.message("请先保存独立的转写服务密钥、HTTPS 地址和模型，再允许分享录音。")
+                }
+            }
+            if backendIdentifier(settings) != backendIdentifier(savedSettings), isProcessing { pauseTranscription() }
+            if savedSettings.remoteASRSharingEnabled == true && requestedASRDisable { pauseTranscription() }
             if settings.localeIdentifier != savedSettings.localeIdentifier, isProcessing { pauseTranscription() }
             if savedSettings.automaticTranscription && !settings.automaticTranscription { pauseTranscription() }
             if !savedSettings.automaticTranscription && settings.automaticTranscription { queuePaused = false }
@@ -151,6 +187,7 @@ final class IntelligenceController: ObservableObject {
             settings = savedSettings
             // A failed settings write must never silently re-enable outbound processing in this process.
             if requestedRemoteDisable { settings.remoteAIEnabled = false; invalidateAIWork() }
+            if requestedASRDisable { settings.remoteASRSharingEnabled = false; processTask?.cancel(); remoteSpeech.cancel() }
             report(error)
         }
     }
@@ -162,6 +199,13 @@ final class IntelligenceController: ObservableObject {
         }
         objectWillChange.send()
     }
+    func setRemoteASRKey(_ key: String) throws {
+        try IntelligenceKeychain.save(key, account: "speech-api-key")
+        if key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            settings.remoteASRSharingEnabled = false; pauseTranscription(); saveSettings()
+        }
+        objectWillChange.send()
+    }
 
     func startTranscription(day: Date? = nil) {
         guard processTask == nil else { return }
@@ -170,13 +214,13 @@ final class IntelligenceController: ObservableObject {
             executionAllowed = true // An explicit UI action occurs while the app is running.
             clipIndex = Dictionary(uniqueKeysWithValues: try store.clips().map { ($0.id, $0) })
             try enqueue(day: day, includeFailed: true)
-            beginProcessing(day: day)
+            beginProcessing(day: day, manual: true)
         } catch { report(error) }
     }
 
     func pauseTranscription() {
         queuePaused = true
-        processTask?.cancel(); speech.cancel()
+        processTask?.cancel(); speech.cancel(); remoteSpeech.cancel()
         do { try persist() } catch { report(error) }
         status = "转写已暂停，完成的窗口已保存"
     }
@@ -193,7 +237,7 @@ final class IntelligenceController: ObservableObject {
         if allowed { refresh() }
         else {
             // System expiration must not overwrite the user's persistent pause preference.
-            processTask?.cancel(); speech.cancel()
+            processTask?.cancel(); speech.cancel(); remoteSpeech.cancel()
             invalidateAIWork()
         }
     }
@@ -218,7 +262,7 @@ final class IntelligenceController: ObservableObject {
                 guard executionAllowed, settings.automaticReview, settings.remoteAIEnabled else { return }
                 let currentPower = UIDevice.current.batteryState
                 guard currentPower == .charging || currentPower == .full else { return }
-                guard !reviews.contains(where: { $0.kind == kind && sameDay($0.day, closure.dayStart) }) else { continue }
+                guard !reviews.contains(where: { $0.kind == kind && sameDay($0.day, closure.dayStart) && $0.pendingTranscriptCount == 0 }) else { continue }
                 let attemptKey = dayKey + "|" + kind.rawValue
                 if let last = automaticReviewAttempts[attemptKey], Date().timeIntervalSince(last) < 3600 { return }
                 automaticReviewAttempts[attemptKey] = Date()
@@ -242,7 +286,7 @@ final class IntelligenceController: ObservableObject {
             await automaticWorkIfAllowed()
         }, onCancel: { [weak self] in
             Task { @MainActor in
-                self?.processTask?.cancel(); self?.speech.cancel(); self?.invalidateAIWork()
+                self?.processTask?.cancel(); self?.speech.cancel(); self?.remoteSpeech.cancel(); self?.invalidateAIWork()
             }
         })
     }
@@ -264,7 +308,7 @@ final class IntelligenceController: ObservableObject {
         guard disk != nil, let original = documents.first(where: { $0.clipID == document.clipID }),
               original.sourceSHA256 == document.sourceSHA256,
               document.duration.isFinite, document.duration > 0,
-              document.completedOffset.isFinite, document.completedOffset >= 0,
+              document.completedOffset.isFinite, document.completedOffset >= 0, document.completedOffset <= document.duration + 0.01,
               document.segments.allSatisfy({ $0.offset.isFinite && $0.duration.isFinite &&
                   $0.offset >= 0 && $0.duration >= 0 && $0.offset + $0.duration <= document.duration + 1 }) else {
             throw IntelligenceError.message("转写时间或来源不匹配，未覆盖原记录。")
@@ -280,7 +324,7 @@ final class IntelligenceController: ObservableObject {
             invalidateAIWork()
             reviews.removeAll { $0.inputClipIDs == nil || $0.inputClipIDs?.contains(document.clipID) == true || $0.citations.contains { $0.clipID == document.clipID } }
             memories.removeAll { ($0.inputClipIDs == nil && !$0.sourceCitations.isEmpty) || $0.inputClipIDs?.contains(document.clipID) == true || $0.sourceCitations.contains { $0.clipID == document.clipID } }
-            if answer?.citations.contains(where: { $0.clipID == document.clipID }) == true { answer = nil }
+            if let current = answer, current.inputClipIDs == nil || current.inputClipIDs?.contains(document.clipID) == true || current.citations.contains(where: { $0.clipID == document.clipID }) { answer = nil }
             searchGeneration = UUID(); searchResults = []
             try persist()
             try disk?.deleteAICaches(containing: document.clipID); reviewProgress = nil
@@ -299,7 +343,7 @@ final class IntelligenceController: ObservableObject {
         reviews.removeAll { $0.inputClipIDs == nil || $0.inputClipIDs?.contains(clipID) == true || $0.citations.contains { $0.clipID == clipID } }
         memories.removeAll { ($0.inputClipIDs == nil && !$0.sourceCitations.isEmpty) || $0.inputClipIDs?.contains(clipID) == true || $0.sourceCitations.contains { $0.clipID == clipID } }
         searchGeneration = UUID(); searchResults.removeAll { $0.clipID == clipID }
-        if answer?.citations.contains(where: { $0.clipID == clipID }) == true { answer = nil }
+        if let current = answer, current.inputClipIDs == nil || current.inputClipIDs?.contains(clipID) == true || current.citations.contains(where: { $0.clipID == clipID }) { answer = nil }
         try persist()
         try disk.deleteDocument(clipID)
         try disk.deleteAICaches(containing: clipID); reviewProgress = nil
@@ -395,6 +439,7 @@ final class IntelligenceController: ObservableObject {
 
     private func enqueue(day: Date?, includeFailed: Bool) throws {
         guard disk != nil else { throw IntelligenceError.message("本地索引不可用，无法保存转写进度。") }
+        let desiredBackend = backendIdentifier(settings), desiredLocale = transcriptionLocale(settings)
         for clip in clipIndex.values.sorted(by: { $0.startedAt < $1.startedAt }) {
             if let day, !sameDay(clip.startedAt, day) { continue }
             if excludedClipIDs.contains(clip.id) {
@@ -402,7 +447,9 @@ final class IntelligenceController: ObservableObject {
                 excludedClipIDs.remove(clip.id)
             }
             let document = documents.first { $0.clipID == clip.id }
-            if document?.isComplete == true && document?.localeIdentifier == settings.localeIdentifier && document?.sourceSHA256 == clip.sha256 {
+            let sameBackend = document?.backendIdentifier == desiredBackend ||
+                (document?.backendIdentifier == nil && transcriptionBackend == .onDevice)
+            if document?.isComplete == true && document?.localeIdentifier == desiredLocale && document?.sourceSHA256 == clip.sha256 && sameBackend {
                 if let index = jobs.firstIndex(where: { $0.clipID == clip.id }) {
                     jobs[index].state = .completed; jobs[index].error = nil
                     jobs[index].completedOffset = document?.completedOffset ?? clip.duration
@@ -421,73 +468,104 @@ final class IntelligenceController: ObservableObject {
         try persist()
     }
 
-    private func beginProcessing(day: Date? = nil) {
+    private func beginProcessing(day: Date? = nil, manual: Bool = false) {
         guard processTask == nil else { return }
+        if transcriptionBackend == .configuredService {
+            guard settings.remoteASRSharingEnabled == true else { status = "远程转写等待你明确允许分享录音"; return }
+            if !manual && !connectedToPower { status = "自动远程转写等待手机充电"; return }
+        }
         func matches(_ job: TranscriptionJob) -> Bool {
             guard job.state == .pending else { return false }
             if let day { return clipIndex[job.clipID].map { sameDay($0.startedAt, day) } ?? false }
             return true
         }
         guard jobs.contains(where: matches) else { status = "没有需要转写的本地录音"; return }
-        isProcessing = true; lastError = nil; status = "准备本机转写"
+        isProcessing = true; lastError = nil
+        status = transcriptionBackend == .onDevice ? "准备本机转写" : "准备所选服务转写"
+        activeWorkerIsManual = manual
         processTask = Task { [weak self] in
             guard let self else { return }
-            defer { self.processTask = nil; self.isProcessing = false }
+            defer { self.processTask = nil; self.isProcessing = false; self.activeWorkerIsManual = false }
             do {
-                try await self.speech.authorize()
+                if self.transcriptionBackend == .onDevice { try await self.speech.authorize() }
                 while !Task.isCancelled, self.executionAllowed, !self.queuePaused, let job = self.jobs.first(where: matches) {
-                    do { try await self.process(job.clipID) }
+                    do { try await self.process(job.clipID, manual: manual) }
                     catch is CancellationError { break }
                     catch {
                         self.changeJob(job.clipID, state: .failed, error: error.localizedDescription)
+                        self.queuePaused = true
                         self.report(error)
                         do { try self.persist() } catch { self.report(error); break }
                         // A missing language model or unavailable recognizer should not drain battery retrying all clips.
                         break
                     }
                 }
-                if !Task.isCancelled && self.lastError == nil { self.status = "本地转写完成" }
+                if !Task.isCancelled && self.lastError == nil { self.status = "转写完成，已保存到本机" }
                 if !Task.isCancelled, self.executionAllowed { await self.automaticWorkIfAllowed() }
-            } catch { self.report(error) }
+            } catch {
+                self.queuePaused = true; self.report(error)
+                do { try self.persist() } catch { self.report(error) }
+            }
         }
     }
 
-    private func process(_ id: UUID) async throws {
+    private func process(_ id: UUID, manual: Bool) async throws {
         guard let clip = clipIndex[id], store.retainAudio(id) else {
             throw IntelligenceError.message("原音频暂不在本机，请先恢复音频后重试。")
         }
         activeClipID = id
         defer { if activeClipID == id { activeClipID = nil }; store.releaseAudio(id) }
-        let locale = settings.localeIdentifier
-        var document = documents.first { $0.clipID == id && $0.sourceSHA256 == clip.sha256 && $0.localeIdentifier == locale }
+        let configuration = settings
+        let locale = transcriptionLocale(configuration), backend = backendIdentifier(configuration)
+        let isRemote = (configuration.transcriptionBackend ?? .onDevice) == .configuredService
+        var document = documents.first { $0.clipID == id && $0.sourceSHA256 == clip.sha256 && $0.localeIdentifier == locale &&
+            ($0.backendIdentifier == backend || ($0.backendIdentifier == nil && !isRemote)) }
             ?? TranscriptDocument(clipID: id, startedAt: clip.startedAt, duration: clip.duration,
-                localeIdentifier: locale, sourceSHA256: clip.sha256, segments: [])
+                localeIdentifier: locale, sourceSHA256: clip.sha256, segments: [], backendIdentifier: backend)
         changeJob(id, state: .running, error: nil)
-        if let index = jobs.firstIndex(where: { $0.clipID == id }) { jobs[index].attempts += 1 }
+        if let index = jobs.firstIndex(where: { $0.clipID == id }) {
+            jobs[index].attempts += 1; jobs[index].completedOffset = document.completedOffset
+        }
         try persist()
         do {
             while document.completedOffset < clip.duration - 0.02 {
                 try Task.checkCancellation()
                 let offset = document.completedOffset, duration = min(50, clip.duration - offset)
-                status = "本机转写 \(Int(offset))/\(Int(clip.duration.rounded(.up))) 秒"
-                let segments = try await speech.transcribe(source: store.audioURL(id), offset: offset,
+                status = "\(isRemote ? "所选服务转写" : "本机转写") \(Int(offset))/\(Int(clip.duration.rounded(.up))) 秒"
+                let segments: [TranscriptSegment]
+                if isRemote {
+                    guard let key = try IntelligenceKeychain.read(account: "speech-api-key"), !key.isEmpty else {
+                        throw IntelligenceError.message("未保存转写服务密钥；没有发送录音。")
+                    }
+                    segments = try await remoteSpeech.transcribe(source: store.audioURL(id), offset: offset,
+                        duration: duration, settings: configuration, key: key, gate: { [weak self] in
+                            guard let self, self.settings.remoteASRSharingEnabled == true,
+                                  self.backendIdentifier(self.settings) == backend,
+                                  self.executionAllowed, !self.excludedClipIDs.contains(id) else { throw CancellationError() }
+                            if !manual && !self.connectedToPower { throw CancellationError() }
+                        })
+                } else {
+                    segments = try await speech.transcribe(source: store.audioURL(id), offset: offset,
                                                           duration: duration, localeIdentifier: locale)
+                }
                 try Task.checkCancellation()
                 guard !excludedClipIDs.contains(id) else { throw CancellationError() }
                 document.segments.append(contentsOf: segments)
                 document.completedOffset = min(clip.duration, offset + duration)
                 document.updatedAt = Date()
-                try disk?.save(document); upsert(document)
+                try commitTranscript(document)
                 if let index = jobs.firstIndex(where: { $0.clipID == id }) { jobs[index].completedOffset = document.completedOffset }
                 try persist()
             }
             document.isComplete = true; document.updatedAt = Date()
-            try disk?.save(document); upsert(document)
+            try commitTranscript(document)
             changeJob(id, state: .completed, error: nil); try persist()
             try removeProcessingHold(id)
-        } catch is CancellationError {
-            changeJob(id, state: .paused, error: nil); try persist()
-            throw CancellationError()
+        } catch {
+            if isCancellation(error) {
+                changeJob(id, state: .paused, error: nil); try persist(); throw CancellationError()
+            }
+            throw error
         }
     }
 
@@ -634,7 +712,8 @@ final class IntelligenceController: ObservableObject {
             let coverage = "已处理全部 \(output.sourceBlockCount) 个原文块、\(sources.count) 个可用转写片段。" +
                 (pendingCount > 0 ? "当天仍有 \(pendingCount) 段录音未完成转写，本回顾暂未覆盖这些录音。" : "覆盖本机已有全部转写；尚未接收的手表录音不在本次输入中。")
             let review = AIReview(kind: kind, day: day, title: output.reply.title, body: body, citations: citations,
-                coverageNote: coverage, sourceFingerprint: output.fingerprint, inputClipIDs: allInputs)
+                coverageNote: coverage, sourceFingerprint: output.fingerprint, inputClipIDs: allInputs,
+                pendingTranscriptCount: pendingCount)
             let oldReviews = reviews, oldMemories = memories
             if let index = reviews.firstIndex(where: { $0.kind == kind && $0.sourceFingerprint == output.fingerprint && sameDay($0.day, day) }) {
                 var reused = review; reused.id = reviews[index].id; reused.createdAt = reviews[index].createdAt
@@ -670,9 +749,28 @@ final class IntelligenceController: ObservableObject {
         Task.isCancelled || error is CancellationError ||
             ((error as NSError).domain == NSURLErrorDomain && (error as NSError).code == NSURLErrorCancelled)
     }
+    private var connectedToPower: Bool {
+        let state = UIDevice.current.batteryState
+        return state == .charging || state == .full
+    }
+    private func transcriptionLocale(_ value: IntelligenceSettings) -> String {
+        guard (value.transcriptionBackend ?? .onDevice) == .configuredService else { return value.localeIdentifier }
+        let language = (value.remoteASRLanguage ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return language.isEmpty ? "auto" : language
+    }
+    private func backendIdentifier(_ value: IntelligenceSettings) -> String {
+        guard (value.transcriptionBackend ?? .onDevice) == .configuredService else { return "local:" + value.localeIdentifier }
+        let parts = [value.remoteASRBaseURL ?? "", value.remoteASRModel ?? "", value.remoteASRLanguage ?? "", value.remoteASRResponseFormat ?? "verbose_json"]
+        let data = (try? JSONEncoder().encode(parts)) ?? Data()
+        return "service:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
     private func upsert(_ document: TranscriptDocument) {
         if let index = documents.firstIndex(where: { $0.clipID == document.clipID }) { documents[index] = document }
         else { documents.append(document); documents.sort { $0.startedAt < $1.startedAt } }
+    }
+    private func commitTranscript(_ document: TranscriptDocument) throws {
+        if documents.contains(where: { $0.clipID == document.clipID }) { try updateDocument(document) }
+        else { try disk?.save(document); upsert(document) }
     }
     private func persist() throws {
         guard let disk else { throw IntelligenceError.message("本地智能记录存储不可用。") }

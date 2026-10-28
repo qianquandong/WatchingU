@@ -16,12 +16,14 @@ final class PhoneContextService: ObservableObject {
     private let health = HKHealthStore()
     private var refreshID = UUID()
     private var settingsObserver: NSObjectProtocol?
+    private var contextObserver: NSObjectProtocol?
     private var healthSettingID = UUID()
 
     init(store: ClipStore, connectivity: Connectivity) throws {
         audioStore = store; self.connectivity = connectivity
         context = try RecordingContextStore(root: store.root)
         settings = try context.settings()
+        if settings.healthEnabled || settings.locationEnabled { status = "按已开启的选项关联可用情境数据" }
         settingsObserver = NotificationCenter.default.addObserver(forName: .recordingContextSettingsChanged,
             object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
@@ -30,9 +32,14 @@ final class PhoneContextService: ObservableObject {
                 if !value.healthEnabled { self.refreshID = UUID(); self.currentSnapshot = nil; self.refreshing = false }
             }
         }
+        contextObserver = NotificationCenter.default.addObserver(forName: .recordingContextChanged,
+            object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.objectWillChange.send() }
+        }
     }
     deinit {
         if let observer = settingsObserver { NotificationCenter.default.removeObserver(observer) }
+        if let observer = contextObserver { NotificationCenter.default.removeObserver(observer) }
     }
     var healthAvailable: Bool { HKHealthStore.isHealthDataAvailable() }
     func setLocationEnabled(_ enabled: Bool) {

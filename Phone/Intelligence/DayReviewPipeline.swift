@@ -16,8 +16,8 @@ final class DayReviewPipeline {
 
     func run(sources: [SourceCitation], recordedAt: [UUID: Date], day: Date, kind: AIReview.Kind,
              pendingTranscripts: Int, settings: IntelligenceSettings, key: String,
-             gate: @escaping () throws -> Void,
-             progress: @escaping (AIReviewProgress) -> Void) async throws -> DayReviewOutput {
+             gate: @escaping @MainActor () throws -> Void,
+             progress: @escaping @MainActor (AIReviewProgress) -> Void) async throws -> DayReviewOutput {
         let clock = ISO8601DateFormatter(); clock.timeZone = DailySchedule().calendar.timeZone
         let lines = sources.enumerated().map { index, source in
             let when = recordedAt[source.clipID].map { clock.string(from: $0.addingTimeInterval(source.offset)) } ?? "unknown"

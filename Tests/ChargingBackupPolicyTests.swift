@@ -48,4 +48,11 @@ final class ChargingBackupPolicyTests: XCTestCase {
         XCTAssertFalse(ChargingBackupPolicy.manualBatchContains(clipEnd: Date(), requestedThrough: invalid))
         XCTAssertNil(ChargingBackupPolicy.reminderDate(oldestPendingEnd: invalid, lastScheduledAlert: nil))
     }
+    func testReplacingAnUndeliveredReminderDoesNotPostponeTheNextClipTo48Hours() {
+        let first = Date(timeIntervalSince1970: 1_000)
+        let next = first.addingTimeInterval(60)
+        let originalAlert = first.addingTimeInterval(86_400)
+        XCTAssertEqual(ChargingBackupPolicy.reminderDate(oldestPendingEnd: next,
+            lastScheduledAlert: originalAlert, now: first.addingTimeInterval(300)), next.addingTimeInterval(86_400))
+    }
 }

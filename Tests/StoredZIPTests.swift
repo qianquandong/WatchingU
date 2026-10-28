@@ -2,7 +2,7 @@ import XCTest
 @testable import ClipStorage
 
 final class StoredZIPTests: XCTestCase {
-    func testArchivePassesIndependentUnzipAndPreservesUnicodeBytes() throws {
+    func testArchivePassesIndependentZIPParserAndPreservesUnicodeBytes() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -11,8 +11,10 @@ final class StoredZIPTests: XCTestCase {
         try content.write(to: source)
         let zip = root.appendingPathComponent("out.zip")
         try StoredZIP.write(entries: [.init(name: "转写/今天.txt", source: source)], to: zip)
-        let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-        process.arguments = ["-p", zip.path, "转写/今天.txt"]
+        // Apple's legacy unzip CLI does not reliably match UTF-8 filename arguments.
+        // Python's independent ZIP parser checks the UTF-8 flag and CRC while reading.
+        let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["python3", "-c", "import sys,zipfile; sys.stdout.buffer.write(zipfile.ZipFile(sys.argv[1]).read(sys.argv[2]))", zip.path, "转写/今天.txt"]
         let pipe = Pipe(); process.standardOutput = pipe
         try process.run()
         let result = pipe.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()

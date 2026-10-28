@@ -20,6 +20,7 @@ struct TranscriptDocument: Codable, Identifiable, Equatable {
     var completedOffset: Double = 0
     var isComplete: Bool = false
     var updatedAt: Date = Date()
+    var backendIdentifier: String? = nil
     var text: String { segments.map(\.text).joined(separator: " ") }
 }
 
@@ -62,6 +63,7 @@ struct AIReview: Codable, Identifiable, Equatable {
     var coverageNote: String? = nil
     var sourceFingerprint: String? = nil
     var inputClipIDs: [UUID]? = nil
+    var pendingTranscriptCount: Int? = nil
 }
 
 struct MemoryFact: Codable, Identifiable, Equatable {
@@ -85,6 +87,11 @@ struct TranscriptionJob: Codable, Identifiable, Equatable {
 }
 
 struct IntelligenceSettings: Codable, Equatable {
+    enum TranscriptionBackend: String, Codable, CaseIterable, Identifiable {
+        case onDevice, configuredService
+        var id: String { rawValue }
+        var title: String { self == .onDevice ? "本机" : "我的转写服务" }
+    }
     var localeIdentifier: String = "zh-CN"
     var automaticTranscription: Bool = false
     // Saving an endpoint or a key alone never permits a network request.
@@ -92,10 +99,17 @@ struct IntelligenceSettings: Codable, Equatable {
     var apiBaseURL: String = ""
     var model: String = ""
     var automaticReview: Bool = false
+    var transcriptionBackend: TranscriptionBackend? = nil
+    var remoteASRSharingEnabled: Bool? = nil
+    var remoteASRBaseURL: String? = nil
+    var remoteASRModel: String? = nil
+    var remoteASRLanguage: String? = nil
+    var remoteASRResponseFormat: String? = nil
 
     init() {}
     enum CodingKeys: String, CodingKey {
         case localeIdentifier, automaticTranscription, remoteAIEnabled, apiBaseURL, model, automaticReview
+        case transcriptionBackend, remoteASRSharingEnabled, remoteASRBaseURL, remoteASRModel, remoteASRLanguage, remoteASRResponseFormat
     }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -105,6 +119,12 @@ struct IntelligenceSettings: Codable, Equatable {
         apiBaseURL = try values.decodeIfPresent(String.self, forKey: .apiBaseURL) ?? ""
         model = try values.decodeIfPresent(String.self, forKey: .model) ?? ""
         automaticReview = try values.decodeIfPresent(Bool.self, forKey: .automaticReview) ?? false
+        transcriptionBackend = try values.decodeIfPresent(TranscriptionBackend.self, forKey: .transcriptionBackend)
+        remoteASRSharingEnabled = try values.decodeIfPresent(Bool.self, forKey: .remoteASRSharingEnabled)
+        remoteASRBaseURL = try values.decodeIfPresent(String.self, forKey: .remoteASRBaseURL)
+        remoteASRModel = try values.decodeIfPresent(String.self, forKey: .remoteASRModel)
+        remoteASRLanguage = try values.decodeIfPresent(String.self, forKey: .remoteASRLanguage)
+        remoteASRResponseFormat = try values.decodeIfPresent(String.self, forKey: .remoteASRResponseFormat)
     }
 }
 
@@ -145,6 +165,26 @@ enum AIContextPlanner {
     static func citationsAreValid(body: String, citations: [String], allowed: Set<String>) -> Bool {
         let inline = IntelligenceMath.sourceTags(in: body)
         return !citations.isEmpty && !inline.isEmpty && Set(citations).isSubset(of: allowed) && inline.isSubset(of: Set(citations))
+    }
+}
+
+struct ConfiguredSpeechResponse: Decodable {
+    struct Segment: Decodable { let start: Double; let end: Double; let text: String }
+    let text: String?
+    let segments: [Segment]?
+    func transcriptSegments(offset: Double, duration: Double) throws -> [TranscriptSegment] {
+        guard offset.isFinite, offset >= 0, duration.isFinite, duration > 0,
+              text != nil || segments != nil else { throw IntelligenceError.message("转写服务响应缺少有效文字或分段。") }
+        if let parts = segments, !parts.isEmpty {
+            guard parts.allSatisfy({ $0.start.isFinite && $0.end.isFinite && $0.start >= 0 && $0.end >= $0.start && $0.end <= duration + 0.3 }) else {
+                throw IntelligenceError.message("转写服务返回的时间戳超出录音窗口，未保存。")
+            }
+            return parts.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.map {
+                TranscriptSegment(offset: offset + $0.start, duration: max(0, min(duration, $0.end) - $0.start), text: $0.text)
+            }.sorted { $0.offset < $1.offset }
+        }
+        let text = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? [] : [TranscriptSegment(offset: offset, duration: duration, text: text)]
     }
 }
 

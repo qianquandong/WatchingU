@@ -17,6 +17,8 @@ final class WatchLocationSampler: NSObject, CLLocationManagerDelegate {
         manager.distanceFilter = 1000
     }
     func start(sessionID: UUID) {
+        // A settings echo and the local toggle may both request the same running sampler.
+        guard self.sessionID != sessionID || timer == nil else { return }
         stop(); self.sessionID = sessionID
         guard (try? context.settings().locationEnabled) == true else { self.sessionID = nil; return }
         if manager.authorizationStatus == .notDetermined {

@@ -26,6 +26,7 @@ final class WatchRecorder: ObservableObject {
     private var stopDeadline: Date?
     private var stopTimer: Timer?
     private var pendingStartAt: Date?
+    private var authorizationID: UUID?
     private var locationSampler: WatchLocationSampler?
 
 
@@ -64,6 +65,13 @@ final class WatchRecorder: ObservableObject {
     func requestForegroundStart() {
         pendingStartAt = Date()
         fulfillStartRequest()
+    }
+    func cancelPendingAuthorization() {
+        guard phase == .authorizing else { return }
+        authorizationID = nil; wantsRecording = false; pendingStartAt = nil
+        UserDefaults.standard.removeObject(forKey: "daytape.pending.record.intent")
+        phase = .idle; notice = "请回到手表前台，再点击开始录音。"
+        publishWidget(reload: true)
     }
     private func consumeLaunchIntent() {
         guard let requested = UserDefaults.standard.object(forKey: "daytape.pending.record.intent") as? Date else { return }
@@ -145,7 +153,7 @@ final class WatchRecorder: ObservableObject {
     func fulfillStartRequest() {
         guard let requested = pendingStartAt, WKApplication.shared().applicationState == .active else { return }
         pendingStartAt = nil
-        guard Date().timeIntervalSince(requested) < 120 else { notice = "请重新点击开始录音。"; return }
+        guard (0..<120).contains(Date().timeIntervalSince(requested)) else { notice = "请重新点击开始录音。"; return }
         start()
     }
 
@@ -159,13 +167,21 @@ final class WatchRecorder: ObservableObject {
             guard !policy.enabled || stopDeadline != nil else { notice = "停止时间无效，未开始录音。"; return }
             try store.sealDueDays()
         } catch { notice = error.localizedDescription; return }
+        let requestID = UUID(); authorizationID = requestID
         wantsRecording = true; phase = .authorizing; notice = nil; publishWidget(reload: true)
         AVAudioSession.sharedInstance().requestRecordPermission { [weak self] allowed in
             DispatchQueue.main.async {
-                guard let self = self, self.wantsRecording, self.phase == .authorizing else { return }
-                guard allowed else { self.phase = .idle; self.notice = "请在系统设置中允许麦克风访问。"; return }
+                guard let self = self, self.authorizationID == requestID,
+                      self.wantsRecording, self.phase == .authorizing else { return }
+                self.authorizationID = nil
+                UserDefaults.standard.removeObject(forKey: "daytape.pending.record.intent")
+                guard allowed else {
+                    self.wantsRecording = false; self.phase = .idle
+                    self.notice = "请在系统设置中允许麦克风访问。"; self.publishWidget(reload: true); return
+                }
                 guard WKApplication.shared().applicationState == .active else {
-                    self.phase = .interrupted; self.notice = "请在手表上打开应用并点击开始。"; return
+                    self.wantsRecording = false; self.phase = .interrupted
+                    self.notice = "请在手表上打开应用并点击开始。"; self.publishWidget(reload: true); return
                 }
                 self.beginCapture()
             }
@@ -177,6 +193,13 @@ final class WatchRecorder: ObservableObject {
             try store.ensureBudget()
             let audioSession = AVAudioSession.sharedInstance()
             try audioSession.setCategory(.record, mode: .measurement, options: [])
+            // Public API, available since watchOS 6. Do not intentionally suppress the user's
+            // system sounds/haptics during a long recording. Focus/notification settings still apply.
+            do { try audioSession.setAllowHapticsAndSystemSoundsDuringRecording(true) }
+            catch {
+                notice = "系统暂未允许录音期间的声音或触感；录音会继续。"
+                store.log("recording-system-haptics-unavailable", detail: error.localizedDescription)
+            }
             try audioSession.setActive(true)
             let id = UUID(); generation = id; recordedSeconds = 0; markedCount = 0; lastAudio = Date()
             try store.beginCaptureMarker(sessionID: id, at: Date())
@@ -236,6 +259,7 @@ final class WatchRecorder: ObservableObject {
     }
     func stop(reason: String? = nil, interrupted: Bool = false) {
         guard phase == .recording || phase == .authorizing else { return }
+        authorizationID = nil
         if !interrupted { wantsRecording = false }
         phase = .finishing; watchdog?.invalidate(); watchdog = nil
         locationSampler?.stop(); publishWidget(reload: true)

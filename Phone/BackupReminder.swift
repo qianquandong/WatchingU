@@ -56,7 +56,7 @@ final class BackupReminder {
         guard state.oldestClipID != clip.id || state.requestID == nil else { return }
         guard let due = ChargingBackupPolicy.reminderDate(
             oldestPendingEnd: clip.startedAt.addingTimeInterval(clip.duration),
-            lastScheduledAlert: state.lastScheduledAlert) else { return }
+            lastScheduledAlert: state.lastScheduledAlert, now: now) else { return }
         let scheduled = max(due, now.addingTimeInterval(1))
         let id = "daytape.backup.overdue." + UUID().uuidString
         let oldID = state.requestID

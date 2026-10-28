@@ -77,7 +77,7 @@ files, groups = {}, {}
 kinds = {".swift": "sourcecode.swift", ".c": "sourcecode.c.c", ".h": "sourcecode.c.h",
     ".plist": "text.plist.xml", ".entitlements": "text.plist.entitlements", ".xcprivacy": "text.xml",
     ".xcassets": "folder.assetcatalog", ".py": "text.script.python", ".sh": "text.script.sh"}
-for folder in ["Shared", "Watch", "Phone", "Widgets", "Tests", "Scripts"]:
+for folder in ["Shared", "Watch", "Phone", "Widgets", "Licenses", "Tests", "Scripts"]:
     children = []
     for path in sorted((ROOT / folder).rglob("*"), key=lambda value: value.relative_to(ROOT).as_posix()):
         if any(part.endswith(".xcassets") or part == "__pycache__" for part in path.relative_to(ROOT / folder).parts[:-1]):
@@ -157,6 +157,9 @@ for name, sdk, suffix, info, entitlements, extension in target_specs:
     resources = [privacy]
     if not extension:
         resources.append(add(name + ":assets", "PBXBuildFile", fileRef=files[folder + "/Assets.xcassets"]))
+    if name == "DayTape":
+        resources += [add(name + ":license:" + path, "PBXBuildFile", fileRef=files[path])
+                      for path in sorted(files) if path.startswith("Licenses/") and path.endswith(".txt")]
     phases.append(add(name + ":resources", "PBXResourcesBuildPhase", buildActionMask=2147483647, files=resources, runOnlyForDeploymentPostprocessing=0))
     children = [] if extension else (["DayTapeWatchWidgets"] if sdk == "watchos" else ["DayTapeWidgets", "DayTapeWatch"])
     phases += [embed(name, child, watch=child == "DayTapeWatch") for child in children]

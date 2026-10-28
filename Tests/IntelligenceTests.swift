@@ -93,4 +93,41 @@ final class IntelligenceTests: XCTestCase {
         let memory = try JSONDecoder().decode(MemoryFact.self, from: JSONEncoder().encode(manualMemory))
         XCTAssertNil(memory.inputClipIDs)
     }
+
+    func testOldSettingsDefaultToOnDeviceWithoutAudioSharingAndConsentIsIndependent() throws {
+        var value = try JSONDecoder().decode(IntelligenceSettings.self, from: Data("{}".utf8))
+        XCTAssertEqual(value.transcriptionBackend ?? .onDevice, .onDevice)
+        XCTAssertNotEqual(value.remoteASRSharingEnabled, true)
+        value.remoteAIEnabled = true
+        XCTAssertNotEqual(value.remoteASRSharingEnabled, true)
+        value.remoteASRSharingEnabled = true
+        value.remoteAIEnabled = false
+        XCTAssertEqual(value.remoteASRSharingEnabled, true)
+    }
+
+    func testConfiguredSpeechSegmentsMapWindowTimestampsToOriginalClip() throws {
+        let json = #"{"text":"later earlier","segments":[{"start":4,"end":6,"text":"later"},{"start":1,"end":2,"text":"earlier"}]}"#
+        let response = try JSONDecoder().decode(ConfiguredSpeechResponse.self, from: Data(json.utf8))
+        let segments = try response.transcriptSegments(offset: 50, duration: 10)
+        XCTAssertEqual(segments.map(\.offset), [51, 54])
+        XCTAssertEqual(segments.map(\.duration), [1, 2])
+        XCTAssertEqual(segments.map(\.text), ["earlier", "later"])
+    }
+
+    func testConfiguredSpeechTextOnlyResponseUsesWholeKnownWindowAndSilenceIsEmpty() throws {
+        let response = try JSONDecoder().decode(ConfiguredSpeechResponse.self, from: Data(#"{"text":"真实服务文字"}"#.utf8))
+        let segments = try response.transcriptSegments(offset: 50, duration: 10)
+        XCTAssertEqual(segments.first?.offset, 50)
+        XCTAssertEqual(segments.first?.duration, 10)
+        XCTAssertEqual(segments.first?.text, "真实服务文字")
+        let silence = try JSONDecoder().decode(ConfiguredSpeechResponse.self, from: Data(#"{"text":"","segments":[]}"#.utf8))
+        XCTAssertTrue(try silence.transcriptSegments(offset: 0, duration: 50).isEmpty)
+    }
+
+    func testConfiguredSpeechRejectsMissingTextAndOutOfRangeTimestamps() throws {
+        let invalid = try JSONDecoder().decode(ConfiguredSpeechResponse.self, from: Data(#"{"segments":[{"start":0,"end":500,"text":"wrong"}]}"#.utf8))
+        XCTAssertThrowsError(try invalid.transcriptSegments(offset: 0, duration: 50))
+        let missing = try JSONDecoder().decode(ConfiguredSpeechResponse.self, from: Data("{}".utf8))
+        XCTAssertThrowsError(try missing.transcriptSegments(offset: 0, duration: 50))
+    }
 }

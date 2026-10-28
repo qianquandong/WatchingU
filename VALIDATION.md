@@ -1,6 +1,20 @@
-# v0.4.1 验证记录 · 2026-10-21
+# 验证记录
 
-## GitHub macOS CI：通过
+## v0.5 当前快照 · 2026-10-28
+
+- 最近已运行的提交：`d996bad`。证据：[Native CI 40642265497](https://github.com/qianquandong/WatchingU/actions/runs/40642265497)。
+- iPhone-build、Watch-build 均通过，证明该提交可完成模拟器目标的编译和链接；不证明签名、安装、实际录音和配对交付。
+- SwiftPM 执行 73 项测试，失败集中在一个 ZIP Unicode 名称读取场景的 2 个断言。测试原用系统 unzip CLI 按 Unicode 文件名读取，已在本地改用 Python 标准库 zipfile 独立解析；修补结果尚待 CI 重跑，不能提前写为通过。
+- 当前后续增量包含可选远程 ASR、独立原声分享授权、接收地址变更后重新授权、取消和数据范围等修补，尚未包含在上述已完成构建的证明中。
+- 默认及旧设置仍使用本机转写；文字 AI 授权不允许发送原声。远程 ASR 需要独立转写密钥、明确的音频接收地址及原声分享开关。修改相应服务地址会撤销原有授权，需重新开启。协议兼容性、实际服务收费及授权撤回效果均待真机／真实服务验收。
+- Windows 环境已做源码审查和 `git diff --check`；Python 电脑客户端 3 项测试由根任务确认通过。不能据此宣称最新 Swift 测试、iPhone 服务端互通或全部功能已通过。
+- 详细功能范围见 `docs/FEATURES_0.5.md`，独立审查问题及回归矩阵见 `docs/REVIEW_FINDINGS.md`。
+
+本轮尚无与苹果自带录音或 Auday 的同条件耗电对照，不能承诺更省电、全天无缺口或后台任务准时执行。Google OAuth／Drive、配对 Watch、声音模型精度、权限与通知投递、HealthKit／位置、分享生命周期及真实 Apple 签名仍需验收。
+
+## v0.4.1 历史验证记录 · 2026-10-21
+
+### GitHub macOS CI：通过
 
 - 验证提交：`38c1bcbc5c0c33ac32a27a6ad2426c3530daead9`。
 - [Native CI #2](https://github.com/qianquandong/WatchingU/actions/runs/39549608563)：全部通过，运行于 GitHub 托管 macOS 15、Xcode 26.3。

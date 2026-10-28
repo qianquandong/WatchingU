@@ -99,6 +99,7 @@ struct WatchHome: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { recorder.reconcile(); transport.pump() }
+            if phase == .background { recorder.cancelPendingAuthorization() }
         }
     }
     private var stateTitle: String {

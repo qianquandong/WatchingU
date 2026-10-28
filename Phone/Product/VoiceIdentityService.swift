@@ -147,6 +147,8 @@ final class VoiceIdentityService: ObservableObject {
     private var work: Task<Void, Never>?
     private var enrollmentGeneration = UUID()
     private var enrollmentAuthorizing = false
+    private var preparationGeneration = UUID()
+    private var preparationTask: Task<Void, Error>?
     init(store: ClipStore) {
         self.store = store; root = store.root.appendingPathComponent("VoiceIdentity", isDirectory: true)
         engine = VoiceIdentityEngine(root: root)
@@ -155,10 +157,20 @@ final class VoiceIdentityService: ObservableObject {
     }
     func prepare() async {
         guard !isBusy else { return }; isBusy = true; errorText = nil
-        defer { isBusy = false }
+        let revision = UUID(); preparationGeneration = revision
+        defer { if preparationGeneration == revision { isBusy = false; preparationTask = nil } }
         status = "正在下载并准备本机声音模型…"
-        do { try await engine.prepareModels(); enabled = true; UserDefaults.standard.set(true, forKey: "daytape.voice.enabled"); status = "本机声音模型已就绪" }
-        catch { errorText = error.localizedDescription; status = "模型准备未完成，可以重试" }
+        let task = Task { try await engine.prepareModels() }; preparationTask = task
+        do {
+            try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
+            guard preparationGeneration == revision else { return }
+            enabled = true; UserDefaults.standard.set(true, forKey: "daytape.voice.enabled"); status = "本机声音模型已就绪"
+        }
+        catch is CancellationError { if preparationGeneration == revision { status = "模型准备已暂停" } }
+        catch {
+            guard preparationGeneration == revision else { return }
+            errorText = error.localizedDescription; status = "模型准备未完成，可以重试"
+        }
     }
     func recordEnrollment() async {
         guard !recording, !isBusy, !enrollmentAuthorizing,
@@ -236,5 +248,9 @@ final class VoiceIdentityService: ObservableObject {
             catch { self.errorText = error.localizedDescription; self.status = "声音识别未完成" }
         }
     }
-    func pause() { work?.cancel(); cancelEnrollment() }
+    func pause() {
+        preparationGeneration = UUID()
+        if preparationTask != nil { preparationTask?.cancel(); preparationTask = nil; if work == nil { isBusy = false } }
+        work?.cancel(); cancelEnrollment()
+    }
 }
