@@ -1,0 +1,79 @@
+name: TestFlight recipient invitation
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Inspect the secret-configured recipient or invite that eligible existing user to the existing internal group
+        type: choice
+        default: inspect
+        options: [inspect, invite-internal]
+      build_number:
+        description: Exact existing CFBundleVersion
+        type: string
+        default: '5.1'
+      marketing_version:
+        description: Existing marketing version
+        type: string
+        default: '0.5.0'
+      internal_group_id:
+        description: Existing DayTape internal group
+        type: string
+        default: d43af501-25bb-4009-9a88-ac6cad53ef36
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testflight-access
+  cancel-in-progress: false
+
+jobs:
+  recipient:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require trusted main
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo '::error::Recipient invitations must run on main.'
+            exit 1
+          fi
+      - name: Check out trusted main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Prepare runtime and offline invitation checks
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/daytape-recipient-venv"
+          "$RUNNER_TEMP/daytape-recipient-venv/bin/python" -m pip install -r Tools/requirements.txt
+          "$RUNNER_TEMP/daytape-recipient-venv/bin/python" -m unittest discover -s Scripts/tests -p 'test_testflight*.py' -v
+      - name: Check or invite the specified recipient
+        shell: bash
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64 }}
+          TF_INVITATION_EMAIL: ${{ secrets.TF_INVITATION_EMAIL }}
+          TF_INVITATION_MODE: ${{ inputs.mode }}
+          TF_INVITATION_BUILD: ${{ inputs.build_number }}
+          TF_INVITATION_VERSION: ${{ inputs.marketing_version }}
+          TF_INVITATION_GROUP: ${{ inputs.internal_group_id }}
+        run: |
+          set +x
+          "$RUNNER_TEMP/daytape-recipient-venv/bin/python" - <<'PY'
+          import os
+          import subprocess
+          import sys
+          if os.environ.get('TF_INVITATION_EMAIL'):
+              print('::add-mask::' + os.environ['TF_INVITATION_EMAIL'], flush=True)
+          args = [sys.executable, 'Scripts/testflight_recipient.py',
+                  '--mode', os.environ['TF_INVITATION_MODE'],
+                  '--build-number', os.environ['TF_INVITATION_BUILD'],
+                  '--marketing-version', os.environ['TF_INVITATION_VERSION'],
+                  '--internal-group-id', os.environ['TF_INVITATION_GROUP']]
+          sys.exit(subprocess.call(args))
+          PY
