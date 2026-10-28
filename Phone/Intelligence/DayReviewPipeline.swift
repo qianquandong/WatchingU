@@ -34,6 +34,7 @@ final class DayReviewPipeline {
             completedBlocks: 0, totalBlocks: blocks.count, pendingTranscripts: pendingTranscripts,
             message: "准备完整处理 \(blocks.count) 个原文块")
         @MainActor func publish(_ message: String) throws {
+            try gate()
             state.message = message; state.updatedAt = Date()
             try disk.saveProgress(state); progress(state)
         }
@@ -109,8 +110,10 @@ final class DayReviewPipeline {
             try publish("完整覆盖现有转写：\(blocks.count)/\(blocks.count) 个原文块；未转写 \(pendingTranscripts) 段")
             return DayReviewOutput(reply: reply, fingerprint: fingerprint, sourceBlockCount: blocks.count)
         } catch {
-            state.phase = error is CancellationError ? .paused : .failed
-            try? publish(error is CancellationError ? "已暂停，完成的分块已保存，继续时不会重发" : error.localizedDescription)
+            let cancelled = Task.isCancelled || error is CancellationError ||
+                ((error as NSError).domain == NSURLErrorDomain && (error as NSError).code == NSURLErrorCancelled)
+            state.phase = cancelled ? .paused : .failed
+            try? publish(cancelled ? "已暂停，完成的分块已保存，继续时不会重发" : error.localizedDescription)
             throw error
         }
     }

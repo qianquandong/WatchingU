@@ -61,6 +61,7 @@ struct AIReview: Codable, Identifiable, Equatable {
     var createdAt: Date = Date()
     var coverageNote: String? = nil
     var sourceFingerprint: String? = nil
+    var inputClipIDs: [UUID]? = nil
 }
 
 struct MemoryFact: Codable, Identifiable, Equatable {
@@ -69,6 +70,7 @@ struct MemoryFact: Codable, Identifiable, Equatable {
     var isActive: Bool = true
     var sourceCitations: [SourceCitation] = []
     var updatedAt: Date = Date()
+    var inputClipIDs: [UUID]? = nil
 }
 
 struct TranscriptionJob: Codable, Identifiable, Equatable {

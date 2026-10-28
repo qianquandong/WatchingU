@@ -332,12 +332,14 @@ final class NightArchiveController: NSObject, ObservableObject, URLSessionTaskDe
                 activeCount = 0
             }
             try await reconcileDays(account: auth.account)
-            await updateReminder()
             if errorText == nil { status = "本轮备份检查完成" }
         } catch {
             if error is CancellationError || (error as? URLError)?.code == .cancelled { status = waitingStatus() }
             else { report(error) }
         }
+        // The last receipt may have committed immediately before unplugging/expiration.
+        // Reconcile the reminder on both success and cancellation, not only a clean pass.
+        await updateReminder()
     }
     private func makeJob(_ clip: Clip, account: String) async throws -> ArchiveJob {
         let pair = try store.hash(store.audioURL(clip.id))

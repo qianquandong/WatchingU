@@ -148,8 +148,8 @@ final class DesktopBridge: ObservableObject {
         case "day":
             let day = request.day ?? ""
             return try object(Array(documents.filter { DailySchedule().dayKey($0.startedAt) == day }.prefix(200)))
-        case "reviews": return try object(Array(intelligence.reviews.filter { !$0.citations.isEmpty && $0.citations.allSatisfy { ids.contains($0.clipID) } }.suffix(50)))
-        case "memories": return try object(Array(intelligence.memories.filter { $0.isActive && !$0.sourceCitations.isEmpty && $0.sourceCitations.allSatisfy { ids.contains($0.clipID) } }.prefix(100)))
+        case "reviews": return try object(Array(intelligence.reviews.filter { ArchiveScopePolicy.permits($0.inputClipIDs, within: ids) }.suffix(50)))
+        case "memories": return try object(Array(intelligence.memories.filter { $0.isActive && ArchiveScopePolicy.permits($0.inputClipIDs, within: ids) }.prefix(100)))
         case "audio":
             guard allowAudio, let id = request.clipID, let clip = clips.first(where: { $0.id == id }),
                   clip.byteCount <= 2 * 1024 * 1024, store.retainAudio(id) else { return ["error":"原声未授权、不在所选范围或本机未保留"] }

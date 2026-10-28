@@ -164,6 +164,9 @@ struct RecordingDetailView: View {
     @State private var confirmDelete = false
     @State private var errorText: String?
     @State private var editing: TranscriptSegment?
+    @State private var sharingAudio: AudioShare?
+    @State private var preparingShare = false
+    private struct AudioShare: Identifiable { let id = UUID(); let url: URL }
     private var document: TranscriptDocument? { intelligence.documents.first { $0.clipID == clip.id } }
     var body: some View {
         List {
@@ -172,7 +175,14 @@ struct RecordingDetailView: View {
                 Text("\(Int(clip.duration)) 秒").foregroundStyle(.secondary)
                 if store.hasLocalAudio(clip.id) {
                     Button(playback.playingID == clip.id ? "停止回放" : "播放原声") { playback.toggle(clip, store: store) }
-                    ShareLink("导出原声", item: store.audioURL(clip.id))
+                    Button(preparingShare ? "正在准备…" : "导出原声") {
+                        preparingShare = true
+                        Task {
+                            do { sharingAudio = AudioShare(url: try await ArchiveExport.audio(clip: clip, store: store)) }
+                            catch { errorText = error.localizedDescription }
+                            preparingShare = false
+                        }
+                    }.disabled(preparingShare)
                 } else if let url = store.cloudReceipt(clip.id)?.viewURL {
                     Link("在 Google Drive 打开原声", destination: url)
                 }
@@ -245,6 +255,9 @@ struct RecordingDetailView: View {
                 do { try intelligence.updateDocument(next) } catch { errorText = error.localizedDescription }
             }
         }
+        .sheet(item: $sharingAudio) { item in
+            AudioExport(url: item.url).onDisappear { ArchiveExport.discard(item.url) }
+        }
     }
     private func clock(_ value: Double) -> String { String(format: "%02d:%02d", Int(value) / 60, Int(value) % 60) }
     private func remove() {
@@ -283,7 +296,10 @@ struct VoiceIdentitySettingsView: View {
         Form {
             Section("本机说话人识别") {
                 Toggle("启用声音识别", isOn: $service.enabled)
-                    .onChange(of: service.enabled) { _, value in UserDefaults.standard.set(value, forKey: "daytape.voice.enabled") }
+                    .onChange(of: service.enabled) { _, value in
+                        UserDefaults.standard.set(value, forKey: "daytape.voice.enabled")
+                        if !value { service.pause() }
+                    }
                 Button(service.isBusy ? "正在准备…" : "下载并准备声音模型") { Task { await service.prepare() } }.disabled(service.isBusy || service.recording)
                 Text(service.status).font(.caption).foregroundStyle(.secondary)
                 if let error = service.errorText { Text(error).foregroundStyle(.orange) }
@@ -316,6 +332,8 @@ struct BulkExportView: View {
     @State private var hour = -1
     @State private var options = ArchiveExport.Options()
     @State private var exporting = false
+    @State private var exportTask: Task<Void, Never>?
+    @Environment(\.scenePhase) private var scenePhase
     @State private var errorText: String?
     @State private var shared: ExportItem?
     private struct ExportItem: Identifiable { let id = UUID(); let url: URL }
@@ -345,10 +363,12 @@ struct BulkExportView: View {
                 Section {
                     Button(exporting ? "正在打包…" : "生成 ZIP 并分享") {
                         exporting = true; errorText = nil
-                        Task {
+                        exportTask = Task {
                             do { shared = ExportItem(url: try await ArchiveExport.make(clips: selected, intelligence: intelligence, store: store, options: options)) }
+                            catch is CancellationError { errorText = "导出已暂停，请保持 App 在前台后重试。" }
                             catch { errorText = error.localizedDescription }
                             exporting = false
+                            exportTask = nil
                         }
                     }.disabled(exporting || selected.isEmpty)
                 }
@@ -358,5 +378,7 @@ struct BulkExportView: View {
                     AudioExport(url: item.url).onDisappear { ArchiveExport.discard(item.url) }
                 }
         }.interactiveDismissDisabled(exporting)
+        .onChange(of: scenePhase) { _, phase in if phase != .active { exportTask?.cancel() } }
+        .onDisappear { exportTask?.cancel() }
     }
 }

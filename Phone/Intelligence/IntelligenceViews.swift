@@ -74,6 +74,7 @@ struct IntelligenceSettingsView: View {
                 Button("测试连接") { Task { await controller.testConnection() } }
                     .disabled(!controller.settings.remoteAIEnabled || controller.isAIProcessing || hasUnsavedProvider)
                 if controller.isAIProcessing { ProgressView("正在请求所选服务") }
+                if controller.isAIProcessing { Button("暂停 AI 处理") { controller.pauseAIProcessing() } }
                 if controller.hasAPIKey {
                     Button("删除 API 密钥并关闭远程 AI", role: .destructive) {
                         do { try controller.setAPIKey(""); apiKey = "" }
@@ -198,6 +199,21 @@ struct DailyReviewsView: View {
                         .disabled(controller.isAIProcessing || !controller.settings.remoteAIEnabled || dayDocuments.isEmpty)
                 }
                 if controller.isAIProcessing { ProgressView("正在处理所选日期") }
+                if let progress = controller.reviewProgress,
+                   DailySchedule().calendar.isDate(progress.day, inSameDayAs: selectedDate) {
+                    VStack(alignment: .leading, spacing: 7) {
+                        ProgressView(value: Double(progress.completedBlocks), total: Double(max(1, progress.totalBlocks)))
+                        Text(progress.message).font(.caption).foregroundStyle(.secondary)
+                        if progress.pendingTranscripts > 0 {
+                            Text("当天尚有 \(progress.pendingTranscripts) 段录音未转写").font(.caption).foregroundStyle(.orange)
+                        }
+                        if !controller.isAIProcessing && (progress.phase == .paused || progress.phase == .failed) {
+                            Button("继续\(progress.kind.title)") { Task { await controller.generateReview(day: progress.day, kind: progress.kind) } }
+                                .disabled(!controller.settings.remoteAIEnabled)
+                        }
+                    }
+                }
+                if controller.isAIProcessing { Button("暂停 AI 处理") { controller.pauseAIProcessing() } }
                 if !controller.settings.remoteAIEnabled {
                     NavigationLink("配置并开启远程 AI") { IntelligenceSettingsView(controller: controller) }
                 }

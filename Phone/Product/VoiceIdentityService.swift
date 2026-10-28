@@ -31,6 +31,7 @@ private actor VoiceIdentityEngine {
         }
     }
     func prepareModels() async throws {
+        try Task.checkCancellation()
         guard manager == nil else { return }
         let configuration = MLModelConfiguration()
         #if targetEnvironment(simulator)
@@ -66,11 +67,13 @@ private actor VoiceIdentityEngine {
     }
     func enroll(url: URL) async throws -> Int {
         try await prepareModels()
+        try Task.checkCancellation()
         guard let manager = manager else { throw IntelligenceError.message("声音模型尚未准备好。") }
         let audio = try samples(url)
         let validation = manager.validateAudio(audio)
         guard validation.isValid else { throw IntelligenceError.message("请在安静处独自朗读，再录一次。") }
         let embedding = try manager.extractSpeakerEmbedding(from: audio)
+        try Task.checkCancellation()
         guard manager.validateEmbedding(embedding) else { throw IntelligenceError.message("没有取得可用声纹，请重新录制。") }
         enrollment.append(embedding)
         if enrollment.count >= 3 {
@@ -80,6 +83,7 @@ private actor VoiceIdentityEngine {
             guard norm > 0 else { throw IntelligenceError.message("声纹资料无效，请重试。") }
             mean = mean.map { $0 / norm }
             let next = LocalVoiceProfile(embedding: mean, createdAt: Date())
+            try Task.checkCancellation()
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             let path = root.appendingPathComponent("voice-profile.json")
             try JSONEncoder().encode(next).write(to: path, options: .atomic)
@@ -105,9 +109,16 @@ private actor VoiceIdentityEngine {
             }
             sessionID = session
         }
-        let result = try manager.performCompleteDiarization(samples(url))
+        let audio = try samples(url)
+        var detected: [TimedSpeakerSegment] = []
+        for start in stride(from: 0, to: audio.count, by: 160_000) {
+            try Task.checkCancellation()
+            let end = min(audio.count, start + 160_000)
+            let result = try manager.performCompleteDiarization(audio[start..<end], sampleRate: 16000, atTime: Double(start) / 16000)
+            detected.append(contentsOf: result.segments)
+        }
         try Task.checkCancellation()
-        return result.segments.map { span in
+        return detected.map { span in
             let similarity = profile.flatMap {
                 IntelligenceMath.cosineSimilarity($0.embedding.map(Double.init), span.embedding.map(Double.init))
             }
@@ -134,6 +145,8 @@ final class VoiceIdentityService: ObservableObject {
     private var recorder: AVAudioRecorder?
     private var recordingTask: Task<Void, Never>?
     private var work: Task<Void, Never>?
+    private var enrollmentGeneration = UUID()
+    private var enrollmentAuthorizing = false
     init(store: ClipStore) {
         self.store = store; root = store.root.appendingPathComponent("VoiceIdentity", isDirectory: true)
         engine = VoiceIdentityEngine(root: root)
@@ -148,10 +161,15 @@ final class VoiceIdentityService: ObservableObject {
         catch { errorText = error.localizedDescription; status = "模型准备未完成，可以重试" }
     }
     func recordEnrollment() async {
-        guard !recording, !isBusy else { return }
+        guard !recording, !isBusy, !enrollmentAuthorizing,
+              UIApplication.shared.applicationState == .active else { return }
+        let generation = UUID(); enrollmentGeneration = generation; enrollmentAuthorizing = true
+        defer { if enrollmentGeneration == generation { enrollmentAuthorizing = false } }
         let allowed = await withCheckedContinuation { continuation in
             AVAudioSession.sharedInstance().requestRecordPermission { continuation.resume(returning: $0) }
         }
+        guard enrollmentGeneration == generation, UIApplication.shared.applicationState == .active,
+              !recording, !isBusy else { return }
         guard allowed else { errorText = "请在系统设置中允许麦克风，才能录制本人声纹。"; return }
         do {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -163,22 +181,26 @@ final class VoiceIdentityService: ObservableObject {
             guard next.record() else { throw IntelligenceError.message("麦克风未开始录制，请重试。") }
             recorder = next; recording = true; status = "请独自朗读 15 秒（第 \(samplesCollected + 1)/3 段）"
             recordingTask = Task { [weak self] in
-                do { try await Task.sleep(nanoseconds: 15_000_000_000); await self?.finishEnrollment(path) }
+                do { try await Task.sleep(nanoseconds: 15_000_000_000); await self?.finishEnrollment(path, generation: generation) }
                 catch { self?.cancelEnrollment() }
             }
         } catch { errorText = error.localizedDescription; cancelEnrollment() }
     }
-    private func finishEnrollment(_ path: URL) async {
+    private func finishEnrollment(_ path: URL, generation: UUID) async {
+        guard enrollmentGeneration == generation else { return }
         recorder?.stop(); recorder = nil; recording = false; isBusy = true
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         defer { isBusy = false; try? FileManager.default.removeItem(at: path) }
         do {
-            samplesCollected = try await engine.enroll(url: path)
+            let count = try await engine.enroll(url: path)
+            guard enrollmentGeneration == generation else { return }
+            samplesCollected = count
             if samplesCollected == 3 { enrolled = true; status = "本人声纹已保存到本机" }
             else { status = "已采集 \(samplesCollected)/3 段，请再录一段" }
         } catch { errorText = error.localizedDescription; status = "这次声纹采集未完成" }
     }
     func cancelEnrollment() {
+        enrollmentGeneration = UUID(); enrollmentAuthorizing = false
         recorder?.stop(); recorder = nil; recording = false; recordingTask?.cancel(); recordingTask = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         try? FileManager.default.removeItem(at: root.appendingPathComponent("enrollment.m4a"))

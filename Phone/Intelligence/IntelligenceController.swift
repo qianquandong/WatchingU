@@ -183,6 +183,11 @@ final class IntelligenceController: ObservableObject {
 
     func retryFailed() { startTranscription() }
 
+    func pauseAIProcessing() {
+        invalidateAIWork()
+        status = "AI 处理已暂停，完成的分块会在继续时复用"
+    }
+
     func setExecutionOpportunity(_ allowed: Bool) {
         executionAllowed = allowed
         if allowed { refresh() }
@@ -225,7 +230,7 @@ final class IntelligenceController: ObservableObject {
     }
 
     func processDuringGrantedOpportunity() async {
-        setExecutionOpportunity(true)
+        guard executionAllowed, !Task.isCancelled else { return }
         await withTaskCancellationHandler(operation: {
             while settings.automaticTranscription, executionAllowed, !Task.isCancelled {
                 refresh()
@@ -236,7 +241,9 @@ final class IntelligenceController: ObservableObject {
             guard !Task.isCancelled, executionAllowed else { return }
             await automaticWorkIfAllowed()
         }, onCancel: { [weak self] in
-            Task { @MainActor in self?.setExecutionOpportunity(false) }
+            Task { @MainActor in
+                self?.processTask?.cancel(); self?.speech.cancel(); self?.invalidateAIWork()
+            }
         })
     }
 
@@ -271,12 +278,12 @@ final class IntelligenceController: ObservableObject {
             }
         if changed {
             invalidateAIWork()
-            reviews.removeAll { $0.citations.contains { $0.clipID == document.clipID } }
-            memories.removeAll { $0.sourceCitations.contains { $0.clipID == document.clipID } }
+            reviews.removeAll { $0.inputClipIDs == nil || $0.inputClipIDs?.contains(document.clipID) == true || $0.citations.contains { $0.clipID == document.clipID } }
+            memories.removeAll { ($0.inputClipIDs == nil && !$0.sourceCitations.isEmpty) || $0.inputClipIDs?.contains(document.clipID) == true || $0.sourceCitations.contains { $0.clipID == document.clipID } }
             if answer?.citations.contains(where: { $0.clipID == document.clipID }) == true { answer = nil }
             searchGeneration = UUID(); searchResults = []
-            try disk?.deleteAICaches(containing: document.clipID); reviewProgress = nil
             try persist()
+            try disk?.deleteAICaches(containing: document.clipID); reviewProgress = nil
         }
         lastError = nil
     }
@@ -289,8 +296,8 @@ final class IntelligenceController: ObservableObject {
         invalidateAIWork()
         jobs.removeAll { $0.clipID == clipID }
         documents.removeAll { $0.clipID == clipID }
-        reviews.removeAll { $0.citations.contains { $0.clipID == clipID } }
-        memories.removeAll { $0.sourceCitations.contains { $0.clipID == clipID } }
+        reviews.removeAll { $0.inputClipIDs == nil || $0.inputClipIDs?.contains(clipID) == true || $0.citations.contains { $0.clipID == clipID } }
+        memories.removeAll { ($0.inputClipIDs == nil && !$0.sourceCitations.isEmpty) || $0.inputClipIDs?.contains(clipID) == true || $0.sourceCitations.contains { $0.clipID == clipID } }
         searchGeneration = UUID(); searchResults.removeAll { $0.clipID == clipID }
         if answer?.citations.contains(where: { $0.clipID == clipID }) == true { answer = nil }
         try persist()
@@ -304,7 +311,8 @@ final class IntelligenceController: ObservableObject {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         let previous = memories
-        memories.append(MemoryFact(text: text, sourceCitations: citations))
+        memories.append(MemoryFact(text: text, sourceCitations: citations,
+            inputClipIDs: citations.isEmpty ? nil : Array(Set(citations.map(\.clipID)))))
         do { try persist(); lastError = nil } catch { memories = previous; report(error) }
     }
 
@@ -313,6 +321,7 @@ final class IntelligenceController: ObservableObject {
               !memory.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let previous = memories[index]
         memories[index] = memory; memories[index].updatedAt = Date()
+        if previous.text != memory.text { memories[index].inputClipIDs = nil }
         do { try persist(); lastError = nil } catch { memories[index] = previous; report(error) }
     }
 
@@ -378,8 +387,10 @@ final class IntelligenceController: ObservableObject {
             _ = try await withTaskCancellationHandler(operation: { try await call.value }, onCancel: { call.cancel() })
             guard remoteGeneration == generation, settings.remoteAIEnabled else { throw CancellationError() }
             status = "AI 连接成功；测试仅发送固定诊断文字"
-        } catch is CancellationError { status = "AI 连接测试已取消" }
-        catch { report(error) }
+        } catch {
+            guard remoteGeneration == generation else { return }
+            if isCancellation(error) { status = "AI 连接测试已取消" } else { report(error) }
+        }
     }
 
     private func enqueue(day: Date?, includeFailed: Bool) throws {
@@ -501,8 +512,19 @@ final class IntelligenceController: ObservableObject {
                 selected.append(source); context += line
             }
             guard !selected.isEmpty else { throw IntelligenceError.message("单个片段文字过长，请缩小或编辑转写后再处理。") }
-            let activeMemories = memories.filter(\.isActive).prefix(40).map(\.text).joined(separator: "\n")
-            if !activeMemories.isEmpty { context += "\nUSER-MANAGED MEMORY (context, not a substitute for recording evidence):\n" + String(activeMemories.prefix(8_000)) }
+            var usedMemories: [MemoryFact] = [], memoryText = ""
+            for memory in memories.filter(\.isActive).prefix(40) {
+                let line = memory.text + "\n"
+                if memoryText.utf8.count + line.utf8.count > 8_000 { break }
+                usedMemories.append(memory); memoryText += line
+            }
+            var actualInputs: Set<UUID>? = Set(selected.map(\.clipID))
+            for memory in usedMemories {
+                guard let dependencies = memory.inputClipIDs else { actualInputs = nil; break }
+                actualInputs?.formUnion(dependencies)
+            }
+            let inputIDs = actualInputs.map { $0.sorted { $0.uuidString < $1.uuidString } }
+            if !memoryText.isEmpty { context += "\nUSER-MANAGED MEMORY (context, not a substitute for recording evidence):\n" + memoryText }
             let configuration = settings
             let call = Task { try await CompatibleAIClient.complete(settings: configuration, key: key,
                                                                    instruction: instruction, context: context) }
@@ -533,21 +555,103 @@ final class IntelligenceController: ObservableObject {
             var seenTags: Set<String> = []
             let citedTags = result.citations.filter { seenTags.insert($0).inserted }
             let review = AIReview(kind: kind, day: day, title: result.title, body: body,
-                                  citations: citedTags.compactMap { lookup[$0] }, coverageNote: coverage)
+                                  citations: citedTags.compactMap { lookup[$0] }, coverageNote: coverage, inputClipIDs: inputIDs)
             let oldReviews = reviews, oldMemories = memories
             reviews.append(review)
             for fact in result.memories ?? [] where !fact.text.isEmpty && !fact.citations.isEmpty && fact.citations.allSatisfy({ lookup[$0] != nil }) {
                 if !memories.contains(where: { $0.text == fact.text }) {
                     // Suggestions remain inactive until the user chooses to activate them.
                     memories.append(MemoryFact(text: fact.text, isActive: false,
-                        sourceCitations: fact.citations.compactMap { lookup[$0] }))
+                        sourceCitations: fact.citations.compactMap { lookup[$0] }, inputClipIDs: inputIDs))
                 }
             }
             do { try persist() } catch { reviews = oldReviews; memories = oldMemories; throw error }
             if kind == .answer { answer = review }
             status = "\(kind.title)已保存"
-        } catch is CancellationError { status = "AI 处理已取消，本地记录已保留" }
-        catch { report(error) }
+        } catch {
+            guard remoteGeneration == generation else { return }
+            if isCancellation(error) { status = "AI 处理已取消，本地记录已保留" } else { report(error) }
+        }
+    }
+
+    private func runDayReview(day: Date, kind: AIReview.Kind, sources: [SourceCitation], requiresCharging: Bool) async {
+        guard !isAIProcessing else { lastError = "已有 AI 任务正在执行。"; return }
+        guard settings.remoteAIEnabled else { lastError = "请先明确开启远程 AI；没有发送任何文字。"; return }
+        guard let disk, !sources.isEmpty else { lastError = "还没有可用转写，未发送请求。"; return }
+        let generation = UUID(); remoteGeneration = generation
+        isAIProcessing = true; lastError = nil
+        var powerObserver: NSObjectProtocol?
+        if requiresCharging {
+            UIDevice.current.isBatteryMonitoringEnabled = true
+            powerObserver = NotificationCenter.default.addObserver(forName: UIDevice.batteryStateDidChangeNotification,
+                                                                   object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in
+                    let power = UIDevice.current.batteryState
+                    if power != .charging && power != .full { self?.dayReviewTask?.cancel() }
+                }
+            }
+        }
+        defer {
+            if let powerObserver { NotificationCenter.default.removeObserver(powerObserver) }
+            if remoteGeneration == generation { isAIProcessing = false; dayReviewTask = nil }
+        }
+        do {
+            guard let key = try IntelligenceKeychain.read(), !key.isEmpty else { throw IntelligenceError.message("未保存 API 密钥。") }
+            let configuration = settings
+            let pendingCount = clipIndex.values.filter { clip in
+                sameDay(clip.startedAt, day) && !documents.contains { $0.clipID == clip.id && $0.isComplete && $0.sourceSHA256 == clip.sha256 }
+            }.count
+            let times = Dictionary(uniqueKeysWithValues: documents.map { ($0.clipID, $0.startedAt) })
+            let pipeline = DayReviewPipeline(disk: disk)
+            let call = Task {
+                try await pipeline.run(sources: sources, recordedAt: times, day: day, kind: kind,
+                    pendingTranscripts: pendingCount, settings: configuration, key: key,
+                    gate: { [weak self] in
+                        guard let self, self.remoteGeneration == generation, self.settings.remoteAIEnabled,
+                              self.settings.apiBaseURL == configuration.apiBaseURL,
+                              self.settings.model == configuration.model else { throw CancellationError() }
+                        if requiresCharging {
+                            let power = UIDevice.current.batteryState
+                            guard self.executionAllowed, power == .charging || power == .full else { throw CancellationError() }
+                        }
+                    }, progress: { [weak self] value in
+                        guard let self, self.remoteGeneration == generation else { return }
+                        self.reviewProgress = value; self.status = value.message
+                    })
+            }
+            dayReviewTask = call
+            let output = try await withTaskCancellationHandler(operation: { try await call.value }, onCancel: { call.cancel() })
+            guard remoteGeneration == generation, settings.remoteAIEnabled else { throw CancellationError() }
+            let lookup = Dictionary(uniqueKeysWithValues: sources.enumerated().map { (AIContextPlanner.sourceID(index: $0.offset), $0.element) })
+            var body = output.reply.body
+            for (tag, source) in lookup {
+                body = body.replacingOccurrences(of: "[\(tag)]", with:
+                    "[\(tag)](daytape://clip/\(source.clipID.uuidString)?offset=\(source.offset))")
+            }
+            var seen: Set<String> = []
+            let citations = output.reply.citations.filter { seen.insert($0).inserted }.compactMap { lookup[$0] }
+            let allInputs = Array(Set(sources.map(\.clipID))).sorted { $0.uuidString < $1.uuidString }
+            let coverage = "已处理全部 \(output.sourceBlockCount) 个原文块、\(sources.count) 个可用转写片段。" +
+                (pendingCount > 0 ? "当天仍有 \(pendingCount) 段录音未完成转写，本回顾暂未覆盖这些录音。" : "覆盖本机已有全部转写；尚未接收的手表录音不在本次输入中。")
+            let review = AIReview(kind: kind, day: day, title: output.reply.title, body: body, citations: citations,
+                coverageNote: coverage, sourceFingerprint: output.fingerprint, inputClipIDs: allInputs)
+            let oldReviews = reviews, oldMemories = memories
+            if let index = reviews.firstIndex(where: { $0.kind == kind && $0.sourceFingerprint == output.fingerprint && sameDay($0.day, day) }) {
+                var reused = review; reused.id = reviews[index].id; reused.createdAt = reviews[index].createdAt
+                reviews[index] = reused
+            } else { reviews.append(review) }
+            for fact in output.reply.memories ?? [] where !fact.text.isEmpty && !fact.citations.isEmpty && fact.citations.allSatisfy({ lookup[$0] != nil }) {
+                if !memories.contains(where: { $0.text == fact.text }) {
+                    memories.append(MemoryFact(text: fact.text, isActive: false,
+                        sourceCitations: fact.citations.compactMap { lookup[$0] }, inputClipIDs: allInputs))
+                }
+            }
+            do { try persist() } catch { reviews = oldReviews; memories = oldMemories; throw error }
+            status = "\(kind.title)已保存，已完整处理本次全部可用文字"
+        } catch {
+            guard remoteGeneration == generation else { return }
+            if isCancellation(error) { status = "AI 处理已暂停，完成的分块已保存，可继续" } else { report(error) }
+        }
     }
 
     private func changeJob(_ id: UUID, state: TranscriptionJob.State, error: String?) {
@@ -555,8 +659,16 @@ final class IntelligenceController: ObservableObject {
         jobs[index].state = state; jobs[index].error = error; jobs[index].updatedAt = Date()
     }
     private func invalidateAIWork() {
+        if isAIProcessing, var progress = reviewProgress, progress.phase != .completed {
+            progress.phase = .paused; progress.message = "处理已暂停，完成的分块已保存，可继续。"; progress.updatedAt = Date()
+            try? disk?.saveProgress(progress); reviewProgress = progress
+        }
         remoteGeneration = UUID(); remoteTask?.cancel(); remoteTask = nil
         dayReviewTask?.cancel(); dayReviewTask = nil; isAIProcessing = false
+    }
+    private func isCancellation(_ error: Error) -> Bool {
+        Task.isCancelled || error is CancellationError ||
+            ((error as NSError).domain == NSURLErrorDomain && (error as NSError).code == NSURLErrorCancelled)
     }
     private func upsert(_ document: TranscriptDocument) {
         if let index = documents.firstIndex(where: { $0.clipID == document.clipID }) { documents[index] = document }
@@ -566,4 +678,16 @@ final class IntelligenceController: ObservableObject {
         guard let disk else { throw IntelligenceError.message("本地智能记录存储不可用。") }
         try disk.save(IntelligenceSnapshot(settings: settings, jobs: jobs, reviews: reviews, memories: memories,
                                            excludedClipIDs: Array(excludedClipIDs), transcriptionPaused: queuePaused,
-                                           automaticReviewA
+                                           automaticReviewAttempts: automaticReviewAttempts))
+    }
+    private func createProcessingHold(_ id: UUID) throws {
+        let url = store.root.appendingPathComponent(id.uuidString + ".processing-hold")
+        if !FileManager.default.fileExists(atPath: url.path) { try Data().write(to: url, options: .atomic) }
+    }
+    private func removeProcessingHold(_ id: UUID) throws {
+        let url = store.root.appendingPathComponent(id.uuidString + ".processing-hold")
+        if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+    }
+    private func sameDay(_ a: Date, _ b: Date) -> Bool { DailySchedule().calendar.isDate(a, inSameDayAs: b) }
+    private func report(_ error: Error) { lastError = error.localizedDescription; status = "需要处理" }
+}

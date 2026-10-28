@@ -56,4 +56,41 @@ final class IntelligenceTests: XCTestCase {
         XCTAssertTrue(IntelligenceMath.sourceTags(in: "[source] [Sx] [not evidence](https://example.com)").isEmpty)
         XCTAssertFalse(IntelligenceMath.sourceTags(in: "事实 [S999]").isSubset(of: Set(["S1", "S2"])))
     }
+
+    func testLongDayPartitionCoversEverySourceExactlyOnceInOrder() {
+        let sizes = (0..<2041).map { 40 + (($0 * 173) % 900) }
+        let blocks = AIContextPlanner.partition(byteCounts: sizes, budget: 32_000)
+        let flattened = blocks.flatMap { $0 }
+        XCTAssertEqual(flattened, Array(sizes.indices))
+        XCTAssertEqual(Set(flattened).count, sizes.count)
+        XCTAssertTrue(blocks.allSatisfy { !$0.isEmpty && $0.reduce(0) { $0 + sizes[$1] } <= 32_000 })
+    }
+
+    func testOversizedSourceIsPreservedAsItsOwnBlockRatherThanTruncated() {
+        let sizes = [10, 50_000, 8, 32_000, 1]
+        let blocks = AIContextPlanner.partition(byteCounts: sizes, budget: 32_000)
+        XCTAssertEqual(blocks.flatMap { $0 }, [0, 1, 2, 3, 4])
+        XCTAssertTrue(blocks.contains([1]))
+        XCTAssertEqual(AIContextPlanner.partition(byteCounts: [], budget: 1), [])
+    }
+
+    func testCitationIDsStayGlobalAcrossBlocksAndMergeCannotInventSources() {
+        let blocks = AIContextPlanner.partition(byteCounts: [10, 10, 10, 10], budget: 20)
+        let second = Set(blocks[1].map { AIContextPlanner.sourceID(index: $0) })
+        XCTAssertEqual(second, Set(["S3", "S4"]))
+        XCTAssertTrue(AIContextPlanner.citationsAreValid(body: "决定交付 [S3]，行动 [S4]", citations: ["S3", "S4"], allowed: second))
+        XCTAssertFalse(AIContextPlanner.citationsAreValid(body: "虚构来源 [S1]", citations: ["S1"], allowed: second))
+        XCTAssertFalse(AIContextPlanner.citationsAreValid(body: "无正文引用", citations: ["S3"], allowed: second))
+        XCTAssertFalse(AIContextPlanner.citationsAreValid(body: "另一个引用 [S4]", citations: ["S3"], allowed: second))
+    }
+
+    func testInputDependenciesSurviveSerializationAndUnknownRemainUnknown() throws {
+        let id = UUID()
+        let review = AIReview(kind: .summary, day: Date(), title: "test", body: "content", citations: [], inputClipIDs: [id])
+        let copy = try JSONDecoder().decode(AIReview.self, from: JSONEncoder().encode(review))
+        XCTAssertEqual(copy.inputClipIDs, [id])
+        let manualMemory = MemoryFact(text: "manually entered")
+        let memory = try JSONDecoder().decode(MemoryFact.self, from: JSONEncoder().encode(manualMemory))
+        XCTAssertNil(memory.inputClipIDs)
+    }
 }

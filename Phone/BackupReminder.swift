@@ -4,6 +4,10 @@ import UserNotifications
 /// One pre-scheduled local reminder survives suspension without polling the battery all day.
 @MainActor
 final class BackupReminder {
+    private enum PermissionError: LocalizedError {
+        case unavailable
+        var errorDescription: String? { "通知权限未开启。" }
+    }
     private struct State: Codable {
         var requestID: String?
         var oldestClipID: UUID?
@@ -21,8 +25,8 @@ final class BackupReminder {
 
     func update(oldest: Clip?, enabled: Bool, now: Date = Date()) async throws {
         if !enabled || oldest == nil {
-            guard state.requestID != nil || state.oldestClipID != nil else { return }
             generation = UUID()
+            guard state.requestID != nil || state.oldestClipID != nil else { return }
             if let id = state.requestID {
                 center.removePendingNotificationRequests(withIdentifiers: [id])
                 center.removeDeliveredNotifications(withIdentifiers: [id])
@@ -32,6 +36,21 @@ final class BackupReminder {
             return
         }
         guard let clip = oldest else { return }
+        // A request added before permission exists can be silently discarded by iOS. Do not
+        // persist its deduplication marker and suppress the later, explicitly authorized one.
+        let observedGeneration = generation
+        let authorization = await center.notificationSettings().authorizationStatus
+        guard generation == observedGeneration else { return }
+        guard authorization == .authorized || authorization == .provisional || authorization == .ephemeral else {
+            generation = UUID()
+            if let id = state.requestID {
+                center.removePendingNotificationRequests(withIdentifiers: [id])
+                center.removeDeliveredNotifications(withIdentifiers: [id])
+            }
+            state = State()
+            try persist()
+            throw PermissionError.unavailable
+        }
         // Keep the original request/marker after delivery. Repeated foreground entries must
         // not schedule a fresh immediate alert for the same overdue recording.
         guard state.oldestClipID != clip.id || state.requestID == nil else { return }

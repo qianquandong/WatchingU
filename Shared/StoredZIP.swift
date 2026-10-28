@@ -24,6 +24,7 @@ final class StoredZIP {
         return crc
     }
     static func write(entries: [Entry], to destination: URL) throws {
+        try Task.checkCancellation()
         guard entries.count <= Int(UInt16.max) else { throw Failure.tooLarge }
         FileManager.default.createFile(atPath: destination.path, contents: nil)
         let output = try FileHandle(forWritingTo: destination)
@@ -32,6 +33,7 @@ final class StoredZIP {
         var records: [Record] = []
         var seen = Set<String>()
         for entry in entries {
+            try Task.checkCancellation()
             let name = Data(entry.name.utf8)
             guard !name.isEmpty, name.count <= Int(UInt16.max), !entry.name.hasPrefix("/"),
                   !entry.name.contains("\\"), !entry.name.contains("\0"),
@@ -41,6 +43,7 @@ final class StoredZIP {
             var crc: UInt32 = 0xffffffff
             var bytes: UInt64 = 0
             while let block = try source.read(upToCount: 256 * 1024), !block.isEmpty {
+                try Task.checkCancellation()
                 crc = checksum(block, previous: crc); bytes += UInt64(block.count)
             }
             let offset = try output.offset()
@@ -55,6 +58,7 @@ final class StoredZIP {
             try source.seek(toOffset: 0)
             var copied: UInt64 = 0; var copiedCRC: UInt32 = 0xffffffff
             while let block = try source.read(upToCount: 256 * 1024), !block.isEmpty {
+                try Task.checkCancellation()
                 try output.write(contentsOf: block); copied += UInt64(block.count)
                 copiedCRC = checksum(block, previous: copiedCRC)
             }
@@ -64,6 +68,7 @@ final class StoredZIP {
         let centralStart = try output.offset()
         guard centralStart <= UInt64(UInt32.max) else { throw Failure.tooLarge }
         for record in records {
+            try Task.checkCancellation()
             try output.write(contentsOf: integer(UInt32(0x02014b50)))
             for value in [UInt16(20), 20, 0x0800, 0, 0, 0x0021] { try output.write(contentsOf: integer(value)) }
             for value in [record.crc, record.size, record.size] { try output.write(contentsOf: integer(value)) }

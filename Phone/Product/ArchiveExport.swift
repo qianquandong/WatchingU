@@ -30,6 +30,7 @@ enum ArchiveExport {
             try append(encoder.encode(try context.marks().filter { $0.clipID.map(ids.contains) == true }), name: "marks.json")
         }
         for clip in clips {
+            try Task.checkCancellation()
             let prefix = "recordings/" + clip.id.uuidString
             if options.audio, store.hasLocalAudio(clip.id) {
                 guard store.retainAudio(clip.id) else { throw ArchiveError.encoding }
@@ -50,20 +51,36 @@ enum ArchiveExport {
             }
         }
         if options.reviews {
-            for review in intelligence.reviews where !review.citations.isEmpty && review.citations.allSatisfy({ ids.contains($0.clipID) }) {
+            for review in intelligence.reviews where ArchiveScopePolicy.permits(review.inputClipIDs, within: ids) {
                 try append(encoder.encode(review), name: "reviews/" + review.id.uuidString + ".json")
                 try append(Data(("# " + review.title + "\n\n" + review.body).utf8), name: "reviews/" + review.id.uuidString + ".md")
             }
+            let memories = intelligence.memories.filter { ArchiveScopePolicy.permits($0.inputClipIDs, within: ids) }
+            try append(encoder.encode(memories), name: "memories.json")
         }
         // The archive clearly describes missing original audio rather than inventing a local copy.
         let missing = clips.filter { !store.hasLocalAudio($0.id) }.map { $0.id.uuidString }
         if !missing.isEmpty { try append(Data(("以下原声仅在云端，未包含在 ZIP：\n" + missing.joined(separator: "\n")).utf8), name: "missing-audio.txt") }
         let frozen = entries
         do {
-            try await Task.detached(priority: .utility) { try StoredZIP.write(entries: frozen, to: destination) }.value
+            let writer = Task.detached(priority: .utility) { try StoredZIP.write(entries: frozen, to: destination) }
+            try await withTaskCancellationHandler(operation: { try await writer.value }, onCancel: { writer.cancel() })
             succeeded = true
             return destination
         } catch { try? FileManager.default.removeItem(at: directory); throw error }
+    }
+    static func audio(clip: Clip, store: ClipStore) async throws -> URL {
+        guard store.retainAudio(clip.id) else { throw ArchiveError.encoding }
+        defer { store.releaseAudio(clip.id) }
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("DayTape-export-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let target = folder.appendingPathComponent(clip.fileName)
+        do {
+            let source = store.audioURL(clip.id)
+            try await Task.detached(priority: .utility) { try FileManager.default.copyItem(at: source, to: target) }.value
+            try Task.checkCancellation()
+            return target
+        } catch { try? FileManager.default.removeItem(at: folder); throw error }
     }
     static func discard(_ url: URL) {
         let directory = url.deletingLastPathComponent()
