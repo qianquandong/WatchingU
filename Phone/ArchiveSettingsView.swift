@@ -17,7 +17,9 @@ struct ArchiveSettingsView: View {
             Section {
                 Toggle("自动备份", isOn: automaticBackup)
                 if archive.settings.enabled {
-                    LabeledContent("每天备份", value: archive.uploadClock.label)
+                    LabeledContent("自动上传", value: "iPhone 充电时")
+                    LabeledContent("电源", value: archive.connectedToPower ? "已接入" : "未接入")
+                    LabeledContent("积压提醒", value: "超过 24 小时")
                     LabeledContent("手机保留", value: archive.settings.purgeAfterVerification ? "最近一天" : "全部录音")
                     LabeledContent("网络", value: archive.settings.wifiOnly ? "仅 Wi-Fi" : "Wi-Fi 或移动网络")
                     Button("修改备份设置") { reconnectGoogle = false; showBackupSetup = true }
@@ -41,7 +43,10 @@ struct ArchiveSettingsView: View {
                     if let day = archive.latestCompleteDay { LabeledContent("最近完整备份日", value: day) }
                     Text("本地 \(archive.localCount) 段 · 已备份 \(archive.cloudCount) 段").font(.subheadline)
                     Button("立即备份") { archive.archiveNow() }
-                    Button("接收备份完成通知") { Task { await archive.configureRoutine() } }
+                    if archive.activeCount > 0 {
+                        Button("停止本轮备份") { archive.cancelCurrentBackup() }
+                    }
+                    Button("接收备份通知") { Task { await archive.configureRoutine() } }
                     if let hint = archive.notificationHint { Text(hint).font(.caption).foregroundStyle(.orange) }
                 } header: { Text("备份状态") }
             }

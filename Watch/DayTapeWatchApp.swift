@@ -63,6 +63,10 @@ struct WatchHome: View {
                 }
                 Text(elapsed).font(.system(size: 26, weight: .medium, design: .monospaced)).minimumScaleFactor(0.6)
                 if recorder.phase == .recording {
+                    Button { recorder.markImportantMoment() } label: {
+                        Label("标记重要时刻 · \(recorder.markedCount)", systemImage: "bookmark.fill")
+                            .frame(maxWidth: .infinity)
+                    }.buttonStyle(.bordered).tint(mint)
                     Button(role: .destructive) { recorder.stop() } label: {
                         Label("停止并保存", systemImage: "stop.fill").frame(maxWidth: .infinity)
                     }.buttonStyle(.borderedProminent).tint(.red)
@@ -85,9 +89,14 @@ struct WatchHome: View {
                 }
                 Text(recorder.routineStatus).font(.caption2).foregroundStyle(.secondary)
                 Button("启用每日提醒") { recorder.configureRoutine() }.font(.caption2)
+                Toggle("记录大致位置", isOn: Binding(get: { recorder.locationEnabled },
+                    set: { recorder.setLocationEnabled($0) })).font(.caption2)
             }.padding(.horizontal, 3)
         }
         .task { recorder.restoreRoutine(); recorder.reconcile(); transport.pump() }
+        .onOpenURL { url in
+            if url.scheme == "daytape", url.host == "record" { recorder.requestForegroundStart() }
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { recorder.reconcile(); transport.pump() }
         }

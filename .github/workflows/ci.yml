@@ -16,7 +16,7 @@ concurrency:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -58,6 +58,17 @@ jobs:
       - name: Test storage and build iPhone and Watch apps
         shell: bash
         run: bash Scripts/ci_build.sh
+
+      - name: Test encrypted desktop client
+        shell: bash
+        run: |
+          python3 -m venv .build/client-venv
+          .build/client-venv/bin/python -m pip install -r Tools/requirements.txt
+          .build/client-venv/bin/python -m unittest discover -s Tools -p 'test_*.py' -v
+
+      - name: Capture iPhone simulator smoke test
+        shell: bash
+        run: python3 Scripts/capture_phone.py
 
       - name: Preserve build diagnostics
         if: always()

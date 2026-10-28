@@ -1,0 +1,569 @@
+import Foundation
+import Combine
+import NaturalLanguage
+import UIKit
+
+private actor LocalTranscriptSearch {
+    struct Result { let hits: [SearchHit]; let semanticAvailable: Bool }
+    private var embeddings: [NLLanguage: NLEmbedding] = [:]
+    func find(_ query: String, documents: [TranscriptDocument], semantic: Bool,
+              localeIdentifier: String) -> Result {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return Result(hits: [], semanticAvailable: true) }
+        let language = NLLanguageRecognizer.dominantLanguage(for: query)
+            ?? NLLanguage(rawValue: Locale(identifier: localeIdentifier).languageCode ?? "en")
+        var model: NLEmbedding?
+        if semantic {
+            if let cached = embeddings[language] { model = cached }
+            else if let loaded = NLEmbedding.sentenceEmbedding(for: language) {
+                embeddings[language] = loaded; model = loaded
+            }
+        }
+        let vector = model?.vector(for: query)
+        var hits: [SearchHit] = []
+        for document in documents {
+            for segment in document.segments where !segment.text.isEmpty {
+                let keyword = IntelligenceMath.keywordScore(query: query, text: segment.text)
+                var similarity = 0.0
+                if let vector, let other = model?.vector(for: segment.text),
+                   let cosine = IntelligenceMath.cosineSimilarity(vector, other) { similarity = cosine }
+                guard keyword > 0 || (semantic && similarity >= 0.45) else { continue }
+                hits.append(SearchHit(clipID: document.clipID, offset: segment.offset, text: segment.text,
+                                      score: keyword * 2 + max(0, similarity), startedAt: document.startedAt))
+            }
+        }
+        return Result(hits: hits.sorted { a, b in
+            if a.score != b.score { return a.score > b.score }
+            return a.startedAt > b.startedAt
+        }.prefix(100).map { $0 }, semanticAvailable: !semantic || vector != nil)
+    }
+}
+
+@MainActor
+final class IntelligenceController: ObservableObject {
+    @Published var settings = IntelligenceSettings()
+    @Published private(set) var documents: [TranscriptDocument] = []
+    @Published private(set) var jobs: [TranscriptionJob] = []
+    @Published private(set) var reviews: [AIReview] = []
+    @Published private(set) var memories: [MemoryFact] = []
+    @Published private(set) var searchResults: [SearchHit] = []
+    @Published private(set) var isProcessing = false
+    @Published private(set) var isAIProcessing = false
+    @Published private(set) var status = "尚未转写"
+    @Published var lastError: String?
+    @Published private(set) var answer: AIReview?
+    @Published private(set) var reviewProgress: AIReviewProgress?
+
+    let store: ClipStore
+    private var disk: IntelligenceDisk?
+    private let speech = LocalSpeechTranscriber()
+    private let localSearch = LocalTranscriptSearch()
+    private var processTask: Task<Void, Never>?
+    private var remoteTask: Task<AIWireReply, Error>?
+    private var dayReviewTask: Task<DayReviewOutput, Error>?
+    private var searchGeneration = UUID()
+    private var remoteGeneration = UUID()
+    private var savedSettings = IntelligenceSettings()
+    private var clipIndex: [UUID: Clip] = [:]
+    private var archiveObserver: NSObjectProtocol?
+    private var activeClipID: UUID?
+    private var excludedClipIDs: Set<UUID> = []
+    private var queuePaused = false
+    private var executionAllowed = false
+    private var automaticReviewAttempts: [String: Date] = [:]
+
+    static var supportedLocales: [Locale] { LocalSpeechTranscriber.supportedLocales }
+    var hasAPIKey: Bool { ((try? IntelligenceKeychain.read()) ?? nil)?.isEmpty == false }
+    var pendingClipIDs: Set<UUID> {
+        Set(jobs.filter { $0.state != .completed }.map(\.clipID))
+    }
+
+    init(store: ClipStore) {
+        self.store = store
+        do {
+            let storage = try IntelligenceDisk(root: store.root)
+            let snapshot = try storage.load()
+            let restored = try storage.documents()
+            disk = storage; settings = snapshot.settings; savedSettings = snapshot.settings
+            excludedClipIDs = Set(snapshot.excludedClipIDs ?? [])
+            documents = restored.filter { !excludedClipIDs.contains($0.clipID) }
+            func current(_ source: SourceCitation) -> Bool {
+                documents.contains { document in document.clipID == source.clipID && document.segments.contains {
+                    abs($0.offset - source.offset) < 0.001 && $0.text == source.text
+                } }
+            }
+            reviews = snapshot.reviews.filter { $0.citations.allSatisfy(current) }
+            memories = snapshot.memories.filter { $0.sourceCitations.allSatisfy(current) }
+            queuePaused = snapshot.transcriptionPaused ?? false
+            automaticReviewAttempts = snapshot.automaticReviewAttempts ?? [:]
+            reviewProgress = try storage.progress()
+            if reviewProgress?.phase != .completed {
+                reviewProgress?.phase = .paused
+                reviewProgress?.message = "上次处理未完成，选择原日期和类型可复用已保存分块继续。"
+            }
+            jobs = snapshot.jobs.map { old in
+                var job = old
+                if job.state == .running { job.state = .paused; job.error = "上次转写中断，可从已保存窗口续接。" }
+                return job
+            }
+            try persist()
+            refresh()
+        } catch {
+            disk = nil; lastError = "无法读取本地智能记录：\(error.localizedDescription)。已有文件未覆盖。"
+            status = "本地索引不可用"
+        }
+        archiveObserver = NotificationCenter.default.addObserver(forName: .archiveChanged, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+    }
+
+    deinit { if let archiveObserver { NotificationCenter.default.removeObserver(archiveObserver) } }
+
+    func refresh() {
+        guard disk != nil else { return }
+        do {
+            clipIndex = Dictionary(uniqueKeysWithValues: try store.clips().map { ($0.id, $0) })
+            if settings.automaticTranscription {
+                try enqueue(day: nil, includeFailed: false)
+                if executionAllowed, !queuePaused, processTask == nil, jobs.contains(where: { $0.state == .pending }) { beginProcessing() }
+            }
+        } catch { report(error) }
+    }
+
+    func saveSettings() {
+        let requestedRemoteDisable = !settings.remoteAIEnabled
+        do {
+            if settings.remoteAIEnabled {
+                _ = try CompatibleAIClient.endpoint(settings.apiBaseURL)
+                guard !settings.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, hasAPIKey else {
+                    throw IntelligenceError.message("请先保存 API 密钥、HTTPS 地址和模型，再开启远程 AI。")
+                }
+            }
+            if settings.localeIdentifier != savedSettings.localeIdentifier, isProcessing { pauseTranscription() }
+            if savedSettings.automaticTranscription && !settings.automaticTranscription { pauseTranscription() }
+            if !savedSettings.automaticTranscription && settings.automaticTranscription { queuePaused = false }
+            if !settings.remoteAIEnabled {
+                invalidateAIWork()
+            }
+            try persist(); savedSettings = settings; lastError = nil
+            if settings.automaticTranscription { refresh() }
+        } catch {
+            settings = savedSettings
+            // A failed settings write must never silently re-enable outbound processing in this process.
+            if requestedRemoteDisable { settings.remoteAIEnabled = false; invalidateAIWork() }
+            report(error)
+        }
+    }
+
+    func setAPIKey(_ key: String) throws {
+        try IntelligenceKeychain.save(key)
+        if key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            settings.remoteAIEnabled = false; saveSettings()
+        }
+        objectWillChange.send()
+    }
+
+    func startTranscription(day: Date? = nil) {
+        guard processTask == nil else { return }
+        do {
+            queuePaused = false
+            executionAllowed = true // An explicit UI action occurs while the app is running.
+            clipIndex = Dictionary(uniqueKeysWithValues: try store.clips().map { ($0.id, $0) })
+            try enqueue(day: day, includeFailed: true)
+            beginProcessing(day: day)
+        } catch { report(error) }
+    }
+
+    func pauseTranscription() {
+        queuePaused = true
+        processTask?.cancel(); speech.cancel()
+        do { try persist() } catch { report(error) }
+        status = "转写已暂停，完成的窗口已保存"
+    }
+
+    func retryFailed() { startTranscription() }
+
+    func setExecutionOpportunity(_ allowed: Bool) {
+        executionAllowed = allowed
+        if allowed { refresh() }
+        else {
+            // System expiration must not overwrite the user's persistent pause preference.
+            processTask?.cancel(); speech.cancel()
+            invalidateAIWork()
+        }
+    }
+
+    func automaticWorkIfAllowed() async {
+        guard executionAllowed else { return }
+        refresh()
+        guard settings.automaticReview, settings.remoteAIEnabled, !isAIProcessing else { return }
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        let power = UIDevice.current.batteryState
+        guard power == .charging || power == .full else { return }
+        do {
+            let schedule = try store.dailySchedule()
+            guard let latest = schedule.latestStop(at: Date()) else { return }
+            let dayKey = schedule.dayKey(latest)
+            guard !store.dayIsBlocked(dayKey),
+                  let closure = try store.dayClosures().map(\.1).first(where: { $0.dayKey == dayKey }),
+                  closure.cutoff <= Date(),
+                  closure.matches(clipIndex.values.filter { schedule.dayKey($0.startedAt) == dayKey }),
+                  closure.clips.allSatisfy({ clip in documents.contains { $0.clipID == clip.id && $0.isComplete && $0.sourceSHA256 == clip.sha256 } }) else { return }
+            for kind in [AIReview.Kind.summary, .reflection] {
+                guard executionAllowed, settings.automaticReview, settings.remoteAIEnabled else { return }
+                let currentPower = UIDevice.current.batteryState
+                guard currentPower == .charging || currentPower == .full else { return }
+                guard !reviews.contains(where: { $0.kind == kind && sameDay($0.day, closure.dayStart) }) else { continue }
+                let attemptKey = dayKey + "|" + kind.rawValue
+                if let last = automaticReviewAttempts[attemptKey], Date().timeIntervalSince(last) < 3600 { return }
+                automaticReviewAttempts[attemptKey] = Date()
+                try persist()
+                await generateReview(day: closure.dayStart, kind: kind, requiresCharging: true)
+                if lastError != nil { return }
+            }
+        } catch { report(error) }
+    }
+
+    func processDuringGrantedOpportunity() async {
+        setExecutionOpportunity(true)
+        await withTaskCancellationHandler(operation: {
+            while settings.automaticTranscription, executionAllowed, !Task.isCancelled {
+                refresh()
+                guard let running = processTask else { break }
+                await running.value
+                if lastError != nil { break }
+            }
+            guard !Task.isCancelled, executionAllowed else { return }
+            await automaticWorkIfAllowed()
+        }, onCancel: { [weak self] in
+            Task { @MainActor in self?.setExecutionOpportunity(false) }
+        })
+    }
+
+    func search(_ query: String, semantic: Bool = true) {
+        lastError = nil
+        let generation = UUID(); searchGeneration = generation
+        let snapshot = documents, locale = settings.localeIdentifier
+        Task {
+            let result = await localSearch.find(query, documents: snapshot, semantic: semantic, localeIdentifier: locale)
+            guard generation == searchGeneration else { return }
+            searchResults = result.hits
+            if semantic && !result.semanticAvailable { status = "此语言没有可用本机语义模型，已返回关键词结果" }
+            else { status = "找到 \(result.hits.count) 个本地片段" }
+        }
+    }
+
+    func updateDocument(_ document: TranscriptDocument) throws {
+        guard disk != nil, let original = documents.first(where: { $0.clipID == document.clipID }),
+              original.sourceSHA256 == document.sourceSHA256,
+              document.duration.isFinite, document.duration > 0,
+              document.completedOffset.isFinite, document.completedOffset >= 0,
+              document.segments.allSatisfy({ $0.offset.isFinite && $0.duration.isFinite &&
+                  $0.offset >= 0 && $0.duration >= 0 && $0.offset + $0.duration <= document.duration + 1 }) else {
+            throw IntelligenceError.message("转写时间或来源不匹配，未覆盖原记录。")
+        }
+        var updated = document; updated.updatedAt = Date()
+        try disk?.save(updated)
+        upsert(updated)
+        let changed = original.text != updated.text || original.segments.count != updated.segments.count ||
+            zip(original.segments, updated.segments).contains { pair in
+                pair.0.offset != pair.1.offset || pair.0.duration != pair.1.duration
+            }
+        if changed {
+            invalidateAIWork()
+            reviews.removeAll { $0.citations.contains { $0.clipID == document.clipID } }
+            memories.removeAll { $0.sourceCitations.contains { $0.clipID == document.clipID } }
+            if answer?.citations.contains(where: { $0.clipID == document.clipID }) == true { answer = nil }
+            searchGeneration = UUID(); searchResults = []
+            try disk?.deleteAICaches(containing: document.clipID); reviewProgress = nil
+            try persist()
+        }
+        lastError = nil
+    }
+
+    func deleteContent(for clipID: UUID) throws {
+        guard let disk else { throw IntelligenceError.message("本地智能记录存储不可用。") }
+        excludedClipIDs.insert(clipID)
+        if activeClipID == clipID { pauseTranscription() }
+        // A pending remote response may still include this text, so do not commit that result.
+        invalidateAIWork()
+        jobs.removeAll { $0.clipID == clipID }
+        documents.removeAll { $0.clipID == clipID }
+        reviews.removeAll { $0.citations.contains { $0.clipID == clipID } }
+        memories.removeAll { $0.sourceCitations.contains { $0.clipID == clipID } }
+        searchGeneration = UUID(); searchResults.removeAll { $0.clipID == clipID }
+        if answer?.citations.contains(where: { $0.clipID == clipID }) == true { answer = nil }
+        try persist()
+        try disk.deleteDocument(clipID)
+        try disk.deleteAICaches(containing: clipID); reviewProgress = nil
+        try removeProcessingHold(clipID)
+        lastError = nil
+    }
+
+    func saveMemory(_ text: String, citations: [SourceCitation] = []) {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        let previous = memories
+        memories.append(MemoryFact(text: text, sourceCitations: citations))
+        do { try persist(); lastError = nil } catch { memories = previous; report(error) }
+    }
+
+    func updateMemory(_ memory: MemoryFact) {
+        guard let index = memories.firstIndex(where: { $0.id == memory.id }),
+              !memory.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let previous = memories[index]
+        memories[index] = memory; memories[index].updatedAt = Date()
+        do { try persist(); lastError = nil } catch { memories[index] = previous; report(error) }
+    }
+
+    func toggleMemory(_ id: UUID) {
+        guard let index = memories.firstIndex(where: { $0.id == id }) else { return }
+        let previous = memories[index]
+        memories[index].isActive.toggle(); memories[index].updatedAt = Date()
+        do { try persist(); lastError = nil } catch { memories[index] = previous; report(error) }
+    }
+
+    func deleteMemory(_ id: UUID) {
+        let previous = memories; memories.removeAll { $0.id == id }
+        do { try persist(); lastError = nil } catch { memories = previous; report(error) }
+    }
+
+    func generateReview(day: Date, kind: AIReview.Kind, requiresCharging: Bool = false) async {
+        let sources = documents.filter { sameDay($0.startedAt, day) }.sorted { $0.startedAt < $1.startedAt }.flatMap { document in
+            document.segments.filter { !$0.text.isEmpty }.sorted { $0.offset < $1.offset }.map {
+                SourceCitation(clipID: document.clipID, offset: $0.offset, text: $0.text)
+            }
+        }
+        if kind != .answer {
+            await runDayReview(day: day, kind: kind, sources: sources, requiresCharging: requiresCharging)
+            return
+        }
+        let instruction: String
+        switch kind {
+        case .summary: instruction = "总结这一天的已提供录音，区分讨论、已决定事项、待办与不确定事项。不要把讨论误写成承诺。"
+        case .highlights: instruction = "选出这一天值得回看的高光、具体安排与重要对话；每项引用原片段。不虚构重要性或心理状态。"
+        case .reflection: instruction = "根据这一天的录音做每日回顾。先总结事实，再把建议明确标为建议；不要诊断情绪、健康或关系。"
+        case .answer: instruction = "根据这些录音回答其中明确出现的事项。"
+        }
+        await runAI(instruction: instruction, sources: sources, kind: kind, day: day)
+    }
+
+    func ask(_ question: String) async {
+        let question = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty else { return }
+        let found = await localSearch.find(question, documents: documents, semantic: true,
+                                            localeIdentifier: settings.localeIdentifier)
+        let sources = found.hits.prefix(60).map { SourceCitation(clipID: $0.clipID, offset: $0.offset, text: $0.text) }
+        guard !sources.isEmpty else {
+            lastError = found.semanticAvailable ? "本地记录没有找到相关片段，未发送 AI 请求。" : "此语言无可用语义模型，且没有匹配关键词；请用记录中的词语再搜索。"
+            return
+        }
+        await runAI(instruction: "回答用户问题：\(question)\n只根据所给历史片段与用户管理的记忆；没有证据就直说。", sources: sources, kind: .answer, day: Date())
+    }
+
+    /// Tests a configured provider with fixed nonpersonal text. Requires the same explicit consent.
+    func testConnection() async {
+        guard settings.remoteAIEnabled else { lastError = "请先明确开启远程 AI，再测试连接。"; return }
+        guard !isAIProcessing else { lastError = "已有 AI 任务正在执行。"; return }
+        let generation = UUID(); remoteGeneration = generation
+        isAIProcessing = true; lastError = nil
+        defer { if remoteGeneration == generation { isAIProcessing = false; remoteTask = nil } }
+        do {
+            guard let key = try IntelligenceKeychain.read(), !key.isEmpty else { throw IntelligenceError.message("未保存 API 密钥。") }
+            let configuration = settings
+            let call = Task { try await CompatibleAIClient.complete(settings: configuration, key: key,
+                instruction: "This is a connection test containing no personal recordings. Return title=Connection test, body=Connection successful [S1], citations=[S1], memories=[].",
+                context: "[S1] Fixed diagnostic text: connection test.") }
+            remoteTask = call
+            _ = try await withTaskCancellationHandler(operation: { try await call.value }, onCancel: { call.cancel() })
+            guard remoteGeneration == generation, settings.remoteAIEnabled else { throw CancellationError() }
+            status = "AI 连接成功；测试仅发送固定诊断文字"
+        } catch is CancellationError { status = "AI 连接测试已取消" }
+        catch { report(error) }
+    }
+
+    private func enqueue(day: Date?, includeFailed: Bool) throws {
+        guard disk != nil else { throw IntelligenceError.message("本地索引不可用，无法保存转写进度。") }
+        for clip in clipIndex.values.sorted(by: { $0.startedAt < $1.startedAt }) {
+            if let day, !sameDay(clip.startedAt, day) { continue }
+            if excludedClipIDs.contains(clip.id) {
+                guard includeFailed else { continue }
+                excludedClipIDs.remove(clip.id)
+            }
+            let document = documents.first { $0.clipID == clip.id }
+            if document?.isComplete == true && document?.localeIdentifier == settings.localeIdentifier && document?.sourceSHA256 == clip.sha256 {
+                if let index = jobs.firstIndex(where: { $0.clipID == clip.id }) {
+                    jobs[index].state = .completed; jobs[index].error = nil
+                    jobs[index].completedOffset = document?.completedOffset ?? clip.duration
+                }
+                try removeProcessingHold(clip.id)
+                continue
+            }
+            guard store.hasLocalAudio(clip.id) else { continue }
+            if let index = jobs.firstIndex(where: { $0.clipID == clip.id }) {
+                if jobs[index].state == .running { continue }
+                if jobs[index].state == .failed && !includeFailed { continue }
+                jobs[index].state = .pending; jobs[index].error = nil
+            } else { jobs.append(TranscriptionJob(clipID: clip.id)) }
+            try createProcessingHold(clip.id)
+        }
+        try persist()
+    }
+
+    private func beginProcessing(day: Date? = nil) {
+        guard processTask == nil else { return }
+        func matches(_ job: TranscriptionJob) -> Bool {
+            guard job.state == .pending else { return false }
+            if let day { return clipIndex[job.clipID].map { sameDay($0.startedAt, day) } ?? false }
+            return true
+        }
+        guard jobs.contains(where: matches) else { status = "没有需要转写的本地录音"; return }
+        isProcessing = true; lastError = nil; status = "准备本机转写"
+        processTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.processTask = nil; self.isProcessing = false }
+            do {
+                try await self.speech.authorize()
+                while !Task.isCancelled, self.executionAllowed, !self.queuePaused, let job = self.jobs.first(where: matches) {
+                    do { try await self.process(job.clipID) }
+                    catch is CancellationError { break }
+                    catch {
+                        self.changeJob(job.clipID, state: .failed, error: error.localizedDescription)
+                        self.report(error)
+                        do { try self.persist() } catch { self.report(error); break }
+                        // A missing language model or unavailable recognizer should not drain battery retrying all clips.
+                        break
+                    }
+                }
+                if !Task.isCancelled && self.lastError == nil { self.status = "本地转写完成" }
+                if !Task.isCancelled, self.executionAllowed { await self.automaticWorkIfAllowed() }
+            } catch { self.report(error) }
+        }
+    }
+
+    private func process(_ id: UUID) async throws {
+        guard let clip = clipIndex[id], store.retainAudio(id) else {
+            throw IntelligenceError.message("原音频暂不在本机，请先恢复音频后重试。")
+        }
+        activeClipID = id
+        defer { if activeClipID == id { activeClipID = nil }; store.releaseAudio(id) }
+        let locale = settings.localeIdentifier
+        var document = documents.first { $0.clipID == id && $0.sourceSHA256 == clip.sha256 && $0.localeIdentifier == locale }
+            ?? TranscriptDocument(clipID: id, startedAt: clip.startedAt, duration: clip.duration,
+                localeIdentifier: locale, sourceSHA256: clip.sha256, segments: [])
+        changeJob(id, state: .running, error: nil)
+        if let index = jobs.firstIndex(where: { $0.clipID == id }) { jobs[index].attempts += 1 }
+        try persist()
+        do {
+            while document.completedOffset < clip.duration - 0.02 {
+                try Task.checkCancellation()
+                let offset = document.completedOffset, duration = min(50, clip.duration - offset)
+                status = "本机转写 \(Int(offset))/\(Int(clip.duration.rounded(.up))) 秒"
+                let segments = try await speech.transcribe(source: store.audioURL(id), offset: offset,
+                                                          duration: duration, localeIdentifier: locale)
+                try Task.checkCancellation()
+                guard !excludedClipIDs.contains(id) else { throw CancellationError() }
+                document.segments.append(contentsOf: segments)
+                document.completedOffset = min(clip.duration, offset + duration)
+                document.updatedAt = Date()
+                try disk?.save(document); upsert(document)
+                if let index = jobs.firstIndex(where: { $0.clipID == id }) { jobs[index].completedOffset = document.completedOffset }
+                try persist()
+            }
+            document.isComplete = true; document.updatedAt = Date()
+            try disk?.save(document); upsert(document)
+            changeJob(id, state: .completed, error: nil); try persist()
+            try removeProcessingHold(id)
+        } catch is CancellationError {
+            changeJob(id, state: .paused, error: nil); try persist()
+            throw CancellationError()
+        }
+    }
+
+    private func runAI(instruction: String, sources: [SourceCitation], kind: AIReview.Kind, day: Date) async {
+        guard !isAIProcessing else { lastError = "已有 AI 任务正在执行。"; return }
+        guard settings.remoteAIEnabled else { lastError = "请先配置并明确开启远程 AI；没有发送任何文字。"; return }
+        guard !sources.isEmpty else { lastError = "还没有可用于分析的转写，未发送请求。"; return }
+        let generation = UUID(); remoteGeneration = generation
+        isAIProcessing = true; lastError = nil
+        defer { if remoteGeneration == generation { isAIProcessing = false; remoteTask = nil } }
+        do {
+            guard let key = try IntelligenceKeychain.read(), !key.isEmpty else { throw IntelligenceError.message("未保存 API 密钥。") }
+            var selected: [SourceCitation] = [], context = ""
+            let clock = ISO8601DateFormatter()
+            clock.timeZone = DailySchedule().calendar.timeZone
+            for source in sources {
+                let recorded = documents.first(where: { $0.clipID == source.clipID })?.startedAt
+                    .addingTimeInterval(source.offset)
+                let when = recorded.map { clock.string(from: $0) } ?? "unknown"
+                let line = "[S\(selected.count + 1)] recordedAt=\(when) clip=\(source.clipID.uuidString) offset=\(String(format: "%.2f", source.offset))s\n\(source.text)\n"
+                if context.utf8.count + line.utf8.count > 80_000 { break }
+                selected.append(source); context += line
+            }
+            guard !selected.isEmpty else { throw IntelligenceError.message("单个片段文字过长，请缩小或编辑转写后再处理。") }
+            let activeMemories = memories.filter(\.isActive).prefix(40).map(\.text).joined(separator: "\n")
+            if !activeMemories.isEmpty { context += "\nUSER-MANAGED MEMORY (context, not a substitute for recording evidence):\n" + String(activeMemories.prefix(8_000)) }
+            let configuration = settings
+            let call = Task { try await CompatibleAIClient.complete(settings: configuration, key: key,
+                                                                   instruction: instruction, context: context) }
+            remoteTask = call
+            let result = try await withTaskCancellationHandler(operation: { try await call.value },
+                                                               onCancel: { call.cancel() })
+            guard settings.remoteAIEnabled, remoteGeneration == generation else { throw CancellationError() }
+            let lookup = Dictionary(uniqueKeysWithValues: selected.enumerated().map { ("S\($0.offset + 1)", $0.element) })
+            guard !result.citations.isEmpty, result.citations.allSatisfy({ lookup[$0] != nil }) else {
+                throw IntelligenceError.message("AI 没有提供有效原始片段引用，结果未保存。")
+            }
+            let inlineTags = IntelligenceMath.sourceTags(in: result.body)
+            guard !inlineTags.isEmpty, inlineTags.isSubset(of: Set(result.citations)) else {
+                throw IntelligenceError.message("AI 的正文引用与原始片段不一致，结果未保存。")
+            }
+            var body = result.body
+            // Replace model-only source tags with durable, tap-resolvable recording references.
+            for (tag, source) in lookup {
+                body = body.replacingOccurrences(of: "[\(tag)]", with:
+                    "[\(tag)](daytape://clip/\(source.clipID.uuidString)?offset=\(source.offset))")
+            }
+            let missingTranscripts = clipIndex.values.contains { clip in
+                sameDay(clip.startedAt, day) && !documents.contains(where: { $0.clipID == clip.id && $0.isComplete })
+            }
+            let incomplete = sources.count > selected.count || missingTranscripts || documents.contains { sameDay($0.startedAt, day) && !$0.isComplete }
+            let coverage: String? = kind == .answer ? "依据本次本地检索命中的片段回答，不表示已检查全部历史。" :
+                (incomplete ? "依据已完成且在本次上下文容量内的录音片段生成，未覆盖全部录音。" : nil)
+            var seenTags: Set<String> = []
+            let citedTags = result.citations.filter { seenTags.insert($0).inserted }
+            let review = AIReview(kind: kind, day: day, title: result.title, body: body,
+                                  citations: citedTags.compactMap { lookup[$0] }, coverageNote: coverage)
+            let oldReviews = reviews, oldMemories = memories
+            reviews.append(review)
+            for fact in result.memories ?? [] where !fact.text.isEmpty && !fact.citations.isEmpty && fact.citations.allSatisfy({ lookup[$0] != nil }) {
+                if !memories.contains(where: { $0.text == fact.text }) {
+                    // Suggestions remain inactive until the user chooses to activate them.
+                    memories.append(MemoryFact(text: fact.text, isActive: false,
+                        sourceCitations: fact.citations.compactMap { lookup[$0] }))
+                }
+            }
+            do { try persist() } catch { reviews = oldReviews; memories = oldMemories; throw error }
+            if kind == .answer { answer = review }
+            status = "\(kind.title)已保存"
+        } catch is CancellationError { status = "AI 处理已取消，本地记录已保留" }
+        catch { report(error) }
+    }
+
+    private func changeJob(_ id: UUID, state: TranscriptionJob.State, error: String?) {
+        guard let index = jobs.firstIndex(where: { $0.clipID == id }) else { return }
+        jobs[index].state = state; jobs[index].error = error; jobs[index].updatedAt = Date()
+    }
+    private func invalidateAIWork() {
+        remoteGeneration = UUID(); remoteTask?.cancel(); remoteTask = nil
+        dayReviewTask?.cancel(); dayReviewTask = nil; isAIProcessing = false
+    }
+    private func upsert(_ document: TranscriptDocument) {
+        if let index = documents.firstIndex(where: { $0.clipID == document.clipID }) { documents[index] = document }
+        else { documents.append(document); documents.sort { $0.startedAt < $1.startedAt } }
+    }
+    private func persist() throws {
+        guard let disk else { throw IntelligenceError.message("本地智能记录存储不可用。") }
+        try disk.save(IntelligenceSnapshot(settings: settings, jobs: jobs, reviews: reviews, memories: memories,
+                                           excludedClipIDs: Array(excludedClipIDs), transcriptionPaused: queuePaused,
+                                           automaticReviewA

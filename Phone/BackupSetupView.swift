@@ -4,13 +4,10 @@ import GoogleSignInSwift
 @MainActor
 struct BackupSetupView: View {
     private enum Step { case account, time, done }
-    private enum Preset: String { case atStop, later, custom }
     @ObservedObject var archive: NightArchiveController
     @ObservedObject var connection: DriveConnection
     @Environment(\.dismiss) private var dismiss
     @State private var step: Step
-    @State private var clock: BackupClock
-    @State private var preset: Preset
     @State private var wifiOnly: Bool
     @State private var keepOneDay: Bool
     @State private var saving = false
@@ -18,20 +15,9 @@ struct BackupSetupView: View {
 
     init(archive: NightArchiveController, reconnect: Bool = false) {
         self.archive = archive; self.connection = archive.connection
-        let value = archive.uploadClock
-        _clock = State(initialValue: value)
-        _preset = State(initialValue: value == BackupClock() ? .atStop : (value == BackupClock(hour: 23, minute: 0) ? .later : .custom))
         _wifiOnly = State(initialValue: archive.settings.wifiOnly)
         _keepOneDay = State(initialValue: archive.settings.purgeAfterVerification)
         _step = State(initialValue: reconnect || archive.connection.accountID == nil ? .account : .time)
-    }
-    private var timeSelection: Binding<Date> {
-        Binding(get: {
-            archive.routine.calendar.date(bySettingHour: clock.hour, minute: clock.minute, second: 0, of: Date()) ?? Date()
-        }, set: { date in
-            let parts = archive.routine.calendar.dateComponents([.hour, .minute], from: date)
-            clock = BackupClock(hour: parts.hour ?? 22, minute: parts.minute ?? 0)
-        })
     }
     var body: some View {
         NavigationStack {
@@ -79,19 +65,9 @@ struct BackupSetupView: View {
                 Button("使用其他 Google 账户") { step = .account }.disabled(saving || archive.activeCount > 0)
             } header: { Text("已连接 Google Drive") }
             Section {
-                Picker("每天备份时间", selection: $preset) {
-                    Text("22:00").tag(Preset.atStop)
-                    Text("23:00").tag(Preset.later)
-                    Text("自定义").tag(Preset.custom)
-                }.pickerStyle(.segmented)
-                if preset == .custom {
-                    DatePicker("每天备份时间", selection: timeSelection, displayedComponents: .hourAndMinute)
-                        .environment(\.timeZone, archive.routine.calendar.timeZone)
-                }
-                if !clock.isValid(for: archive.routine) {
-                    Text("时间范围：22:00–07:59").foregroundStyle(.orange)
-                }
-            } header: { Text("备份时间") }
+                LabeledContent("自动上传", value: "iPhone 充电时")
+                LabeledContent("积压提醒", value: "超过 24 小时")
+            } header: { Text("备份条件") }
             Section {
                 Toggle("仅在 Wi-Fi 下上传", isOn: $wifiOnly)
                 Picker("手机保留", selection: $keepOneDay) {
@@ -104,7 +80,7 @@ struct BackupSetupView: View {
                 Button {
                     saving = true
                     Task {
-                        if await archive.saveAutomaticBackup(clock: clock, wifiOnly: wifiOnly, keepOneDay: keepOneDay) {
+                        if await archive.saveAutomaticBackup(wifiOnly: wifiOnly, keepOneDay: keepOneDay) {
                             step = .done
                             await archive.configureRoutine()
                         }
@@ -112,12 +88,8 @@ struct BackupSetupView: View {
                     }
                 } label: {
                     HStack { Spacer(); if saving { ProgressView() }; Text(saving ? "正在保存…" : "完成并开启").bold(); Spacer() }
-                }.disabled(saving || !clock.isValid(for: archive.routine))
+                }.disabled(saving)
             }
-        }
-        .onChange(of: preset) { _, value in
-            if value == .atStop { clock = BackupClock() }
-            if value == .later { clock = BackupClock(hour: 23, minute: 0) }
         }
     }
     private var doneStep: some View {

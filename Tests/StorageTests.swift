@@ -66,6 +66,28 @@ final class StorageTests: XCTestCase {
         // Delayed duplicate ACK is harmless.
         XCTAssertNoThrow(try store.acknowledge(Receipt(clip: clip)))
     }
+    func testExplicitDeletionDoesNotResurrectAfterLateRetransmission() throws {
+        let store = try ClipStore(root: root.appendingPathComponent("phone"))
+        let (inbox, clip) = try fixture(store); _ = try store.receive(inbox, clip: clip)
+        try store.deleteByUser(clip)
+        XCTAssertFalse(store.hasLocalAudio(clip.id)); XCTAssertTrue(try store.clips().isEmpty)
+        let reopened = try ClipStore(root: store.root)
+        XCTAssertTrue(try reopened.receive(inbox, clip: clip).matches(clip))
+        XCTAssertFalse(reopened.hasLocalAudio(clip.id)); XCTAssertTrue(try reopened.clips().isEmpty)
+        let (badInbox, badClip) = try fixture(store, id: clip.id, content: "conflicting retransmission")
+        XCTAssertThrowsError(try reopened.receive(badInbox, clip: badClip))
+    }
+    func testPendingTranscriptionSurvivesVerifiedCloudCleanup() throws {
+        let store = try ClipStore(root: root.appendingPathComponent("phone"))
+        let (inbox, clip) = try fixture(store); _ = try store.receive(inbox, clip: clip)
+        let hold = store.root.appendingPathComponent(clip.id.uuidString + ".processing-hold")
+        try Data().write(to: hold)
+        try store.commitCloudReceipt(cloud(clip), clip: clip, purge: true, uploadActive: false)
+        XCTAssertTrue(store.hasLocalAudio(clip.id))
+        try FileManager.default.removeItem(at: hold)
+        try store.commitCloudReceipt(cloud(clip), clip: clip, purge: true, uploadActive: false)
+        XCTAssertFalse(store.hasLocalAudio(clip.id))
+    }
     private func cloud(_ clip: Clip, bytes: UInt64? = nil) -> CloudReceipt {
         CloudReceipt(clipID: clip.id, fileID: "audio", metadataFileID: "metadata", accountID: "account",
                      byteCount: bytes ?? clip.byteCount, sha256: clip.sha256, verifiedAt: Date())

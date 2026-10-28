@@ -61,11 +61,27 @@ final class ClipStore {
             guard receipt.matches(clip) else { throw CloudArchiveError.remoteMismatch }
             try save(receipt, at: cloudURL(clip.id))
             let persisted = cloudReceipt(clip.id)?.matches(clip) == true
+            let processingHeld = fm.fileExists(atPath: root.appendingPathComponent(clip.id.uuidString + ".processing-hold").path)
             if rr_can_purge_cloud_copy(1, persisted ? 1 : 0, uploadActive ? 1 : 0,
-                                      purge && (pins[clip.id] ?? 0) == 0 ? 0 : 1) != 0 {
+                                      purge && !processingHeld && (pins[clip.id] ?? 0) == 0 ? 0 : 1) != 0 {
                 if fm.fileExists(atPath: audioURL(clip.id).path) { try fm.removeItem(at: audioURL(clip.id)) }
             }
         }
+    }
+
+    /// Explicit user deletion never touches Drive. A minimal tombstone prevents a late
+    /// already-acknowledged Watch retransmission from restoring a deleted recording.
+    func deleteByUser(_ clip: Clip) throws {
+        try locked {
+            guard (pins[clip.id] ?? 0) == 0 else { throw ArchiveError.conflict }
+            try save(Receipt(clip: clip), at: root.appendingPathComponent(clip.id.uuidString + ".deleted.json"))
+            for url in [audioURL(clip.id), manifestURL(clip.id), cloudURL(clip.id),
+                        root.appendingPathComponent(clip.id.uuidString + ".processing-hold")] {
+                if fm.fileExists(atPath: url.path) { try fm.removeItem(at: url) }
+            }
+            cachedIndex?.removeValue(forKey: clip.id)
+        }
+        NotificationCenter.default.post(name: .archiveChanged, object: nil)
     }
 
     private func protect(_ url: URL) throws {
@@ -157,6 +173,12 @@ final class ClipStore {
             guard clip.isValid else { throw ArchiveError.invalidMetadata }
             let (count, digest) = try hash(inbox)
             guard count == clip.byteCount && digest == clip.sha256 else { throw ArchiveError.checksumMismatch }
+            let tombstone = root.appendingPathComponent(clip.id.uuidString + ".deleted.json")
+            if fm.fileExists(atPath: tombstone.path) {
+                let receipt = try decoder.decode(Receipt.self, from: Data(contentsOf: tombstone))
+                guard receipt.matches(clip) else { throw ArchiveError.conflict }
+                return receipt
+            }
             let destination = audioURL(clip.id)
             if fm.fileExists(atPath: destination.path) {
                 let current = try hash(destination)
